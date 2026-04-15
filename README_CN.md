@@ -19,7 +19,7 @@
 
 <p align="center">
   <a href="#快速开始">快速开始</a> •
-  <a href="#特性">强大之处</a> •
+  <a href="#强大之处">强大之处</a> •
   <a href="#技术方案">技术方案</a> •
   <a href="docs/">文档</a> •
   <a href="./README.md">English</a>
