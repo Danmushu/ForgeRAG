@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/deeplethe/ForgeRAG/releases"><img src="https://img.shields.io/badge/version-0.1.0-brightgreen?style=for-the-badge" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge" alt="License: MIT"></a>
   <a href="https://github.com/deeplethe/ForgeRAG"><img src="https://img.shields.io/github/stars/deeplethe/ForgeRAG?style=for-the-badge" alt="Stars"></a>
   <a href="https://github.com/deeplethe/ForgeRAG/issues"><img src="https://img.shields.io/github/issues/deeplethe/ForgeRAG?style=for-the-badge" alt="Issues"></a>
@@ -26,9 +27,7 @@
 
 ---
 
-## Technical Approach
-
-<img src="docs/images/architecture.png" alt="ForgeRAG Architecture" width="700">
+<p align="center"><img src="docs/images/architecture.png" alt="ForgeRAG Architecture" width="700"></p>
 
 ### The Problem with Existing Approaches
 
@@ -66,7 +65,7 @@ We evaluate against [LightRAG](https://github.com/HKUDS/LightRAG) using the **Ul
 
 ## Features
 
-<img src="docs/images/chat_demo.gif" alt="ForgeRAG Demo" width="700">
+<p align="center"><img src="docs/images/chat_demo.gif" alt="ForgeRAG Demo" width="700"></p>
 
 Compared to heavier platforms like RAGFlow, ForgeRAG focuses on **core pipeline design** — a lean retrieval-answering chain you can deploy **out of the box**.
 
@@ -89,12 +88,15 @@ Compared to heavier platforms like RAGFlow, ForgeRAG focuses on **core pipeline 
 <br/>
 
 **Chat** · Structured answers with pixel-precise citations
+
 <img src="docs/screenshots/chat_sample.png" alt="Chat" width="700">
 
 **Ingestion** · Document processing pipeline with tree building
+
 <img src="docs/screenshots/ingest_demo.png" alt="Ingestion" width="700">
 
 **Knowledge Graph** · Entity-relation visualization
+
 <img src="docs/screenshots/kg_demo.png" alt="Knowledge Graph" width="700">
 
 </details>
@@ -122,8 +124,8 @@ pip install -r requirements.txt
 # Frontend
 cd web && npm install && npm run build && cd ..
 
-# Configure (minimal: just set your API key)
-export OPENAI_API_KEY=sk-...
+# Configure (interactive wizard: pick provider, set keys, done)
+python scripts/setup.py
 
 # Run (use multiple workers for responsive UI during ingestion)
 python main.py --workers 4
@@ -226,6 +228,12 @@ ForgeRAG/
 - [ ] 📦 Python SDK · `pip install forgerag-sdk`
 - [ ] 🛠️ Config panel hints & diagnostics · Missing provider warnings, validation feedback
 - [ ] ⚡ Performance optimization · Faster ingestion, query caching, async embedding
+
+## Contributing
+
+We welcome contributions of all kinds — bug fixes, new features, documentation improvements, and more.
+
+Please read our [Contributing Guide](CONTRIBUTING.md) before submitting a pull request.
 
 ## Related Projects
 

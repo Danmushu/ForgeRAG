@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/deeplethe/ForgeRAG/releases"><img src="https://img.shields.io/badge/version-0.1.0-brightgreen?style=for-the-badge" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge" alt="License: MIT"></a>
   <a href="https://github.com/deeplethe/ForgeRAG"><img src="https://img.shields.io/github/stars/deeplethe/ForgeRAG?style=for-the-badge" alt="Stars"></a>
   <a href="https://github.com/deeplethe/ForgeRAG/issues"><img src="https://img.shields.io/github/issues/deeplethe/ForgeRAG?style=for-the-badge" alt="Issues"></a>
@@ -26,9 +27,7 @@
 
 ---
 
-## 技术方案
-
-<img src="docs/images/architecture.png" alt="ForgeRAG 架构" width="700">
+<p align="center"><img src="docs/images/architecture.png" alt="ForgeRAG 架构" width="700"></p>
 
 ### 现有方案的问题
 
@@ -66,7 +65,7 @@
 
 ## 强大之处
 
-<img src="docs/images/chat_demo.gif" alt="ForgeRAG 演示" width="700">
+<p align="center"><img src="docs/images/chat_demo.gif" alt="ForgeRAG 演示" width="700"></p>
 
 相比 RAGFlow 等较重的平台，ForgeRAG 专注于**核心管道设计**，开箱即用。
 
@@ -89,12 +88,15 @@
 <br/>
 
 **对话** · 结构化回答 + 像素级精准引用
+
 <img src="docs/screenshots/chat_sample.png" alt="对话" width="700">
 
 **文档入库** · 树构建 + 处理流水线
+
 <img src="docs/screenshots/ingest_demo.png" alt="入库" width="700">
 
 **知识图谱** · 实体关系可视化
+
 <img src="docs/screenshots/kg_demo.png" alt="知识图谱" width="700">
 
 </details>
@@ -122,8 +124,8 @@ pip install -r requirements.txt
 # 前端
 cd web && npm install && npm run build && cd ..
 
-# 配置（最简：只需设置 API Key）
-export OPENAI_API_KEY=sk-...
+# 配置（交互式引导：选择提供商、填写 Key、完成）
+python scripts/setup.py
 
 # 运行（建议多 worker 以保证入库时 UI 响应流畅）
 python main.py --workers 4
@@ -226,6 +228,12 @@ ForgeRAG/
 - [ ] 📦 Python SDK · `pip install forgerag-sdk`
 - [ ] 🛠️ 配置面板提示与诊断 · 缺失 provider 警告、参数校验反馈
 - [ ] ⚡ 性能优化 · 更快的入库、查询缓存、异步嵌入
+
+## 参与贡献
+
+我们欢迎各种形式的贡献 —— Bug 修复、新功能、文档改进等。
+
+提交 Pull Request 前请先阅读[贡献指南](CONTRIBUTING.md)。
 
 ## 相关项目
 
