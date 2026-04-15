@@ -15,7 +15,6 @@ from parser.schema import (
     ParseTrace,
     TocEntry,
 )
-from parser.tree_builder import TreeBuilder
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -87,7 +86,22 @@ def _mk_doc(
 
 
 def _build(doc: ParsedDocument, cfg: ChunkerConfig | None = None):
-    tree = TreeBuilder(TreeBuilderConfig()).build(doc)
+    """Build tree using direct strategy (TOC/headings) for test determinism.
+
+    Production build() requires llm_enabled for non-fallback trees, but
+    tests need deterministic TOC/heading trees without LLM calls.
+    """
+    from parser.tree_builder import _BuildContext, _quality_score
+
+    tb_cfg = TreeBuilderConfig()
+    ctx = _BuildContext(doc, cfg=tb_cfg)
+    if doc.toc:
+        tree = ctx.from_toc()
+    elif doc.profile.heading_hint_strength >= 0.20:
+        tree = ctx.from_headings()
+    else:
+        tree = ctx.flat_fallback()
+    tree.quality_score = _quality_score(tree, doc, tb_cfg)
     chunks = Chunker(cfg or ChunkerConfig()).chunk(doc, tree)
     return tree, chunks
 
