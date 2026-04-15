@@ -1,0 +1,61 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+fastapi>=0.110
+pydantic>=2.0
+SQLAlchemy>=2.0
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+litellm>=1.40
+PyYAML>=6.0
+networkx>=3.0
+alembic>=1.13
+
+# ── PDF parsing ──────────────────────────────────────────────────────────────
+PyMuPDF>=1.24
+
+# ── Document conversion (DOCX/PPTX/XLSX/HTML/MD → PDF) ──────────────────────
+fpdf2>=2.8
+python-docx>=1.1
+python-pptx>=1.0
+openpyxl>=3.1
+beautifulsoup4>=4.12
+markdown>=3.6
+
+# ── Optional: local embedding models ─────────────────────────────────────────
+# sentence-transformers>=3.0
+
+# ── Optional: ChromaDB vector store ──────────────────────────────────────────
+# chromadb>=0.5
+
+# ── Optional: Qdrant vector store ────────────────────────────────────────────
+# qdrant-client>=1.9
+
+# ── Optional: Milvus vector store ────────────────────────────────────────────
+# pymilvus>=2.4
+
+# ── Optional: Weaviate vector store ──────────────────────────────────────────
+# weaviate-client>=4.5
+
+# ── Optional: pgvector (use with PostgreSQL) ─────────────────────────────────
+# psycopg[binary]>=3.1
+
+# ── Optional: MySQL backend ──────────────────────────────────────────────────
+# pymysql>=1.1
+
+# ── Optional: Neo4j graph store ──────────────────────────────────────────────
+# neo4j>=5.0
+
+# ── Optional: S3 blob storage ────────────────────────────────────────────────
+# boto3>=1.34
+
+# ── Optional: Alibaba OSS blob storage ───────────────────────────────────────
+# oss2>=2.18
+
+# ── Optional: FAISS vector index (KG semantic search acceleration) ──────────
+# faiss-cpu>=1.7
+
+# ── Optional: Leiden community detection (Knowledge Graph) ──────────────────
+# python-igraph>=0.11
+# leidenalg>=0.10
+
+# ── Optional: MinerU advanced PDF backend ────────────────────────────────────
+# mineru

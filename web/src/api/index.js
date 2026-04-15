@@ -1,0 +1,120 @@
+/**
+ * ForgeRAG API — 统一导出
+ *
+ * 按模块分文件,这里汇总导出供 Vue 组件使用。
+ *
+ * @example
+ * import { askQueryStream, listDocuments, updateSetting } from '@/api'
+ */
+
+// HTTP client (底层,通常不直接使用)
+export { request, get, post, put, patch, del } from './client'
+
+// Health & System
+export {
+  getHealth,
+  getStats,
+  getRetrievalStatus,
+  rebuildBM25,
+  testConnection,
+  getInfrastructure,
+} from './health'
+
+// Files (上传层)
+export {
+  uploadFile,
+  uploadFromUrl,
+  listFiles,
+  getFile,
+  fileDownloadUrl,
+  filePreviewUrl,
+  deleteFile,
+} from './files'
+
+// Documents (入库 + 管理 + 子资源)
+export {
+  ingestDocument,
+  uploadAndIngest,
+  listDocuments,
+  getDocument,
+  deleteDocument,
+  stopDocument,
+  reparseDocument,
+  listBlocks,
+  listChunks,
+  getTree,
+  getTreeNode,
+} from './documents'
+
+// Chunks & Blocks (独立访问)
+export {
+  getChunk,
+  getChunkNeighbors,
+  searchChunks,
+  getChunksByNode,
+  getChunkByBlock,
+  getBlock,
+  blockImageUrl,
+  getBlocksByPage,
+} from './chunks'
+
+// Query (检索 + 生成)
+export {
+  askQuery,
+  askQueryStream,
+} from './query'
+
+// Conversations (多轮对话)
+export {
+  listConversations,
+  createConversation,
+  getConversation,
+  updateConversation,
+  deleteConversation,
+  getMessages,
+  addMessage,
+} from './conversations'
+
+// Traces (查询审计)
+export {
+  listTraces,
+  getTrace,
+  deleteTrace,
+} from './traces'
+
+// Settings (运行时配置)
+export {
+  getAllSettings,
+  getSettingsByGroup,
+  getSetting,
+  updateSetting,
+  batchUpdateSettings,
+  resetSetting,
+  resetGroup,
+  resetAllSettings,
+  applySettings,
+} from './settings'
+
+// LLM Providers (pluggable model registry)
+export {
+  listLLMProviders,
+  getLLMProvider,
+  createLLMProvider,
+  updateLLMProvider,
+  deleteLLMProvider,
+} from './llmProviders'
+
+// Knowledge Graph
+export {
+  getGraphStats,
+  searchEntities,
+  getEntityDetail,
+  getSubgraph,
+  getFullGraph,
+} from './graph'
+
+// Benchmark
+export {
+  startBenchmark, cancelBenchmark, getBenchmarkStatus,
+  downloadBenchmarkReport,
+} from './benchmark'

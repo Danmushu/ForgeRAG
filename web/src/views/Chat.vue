@@ -1,0 +1,930 @@
+<script>
+// ── Module-level state: survives component unmount/remount ──
+// When the user navigates away (e.g. to Architecture) and back,
+// the component is destroyed and recreated, but these refs persist
+// so the streaming progress and messages are still visible.
+import { ref } from 'vue'
+
+export default { name: 'ChatView' }
+
+const _msgs = ref([])
+const _streaming = ref(false)
+const _streamText = ref('')
+const _retInfo = ref(null)
+const _livePhases = ref({})
+const _liveElapsed = ref({})
+const _abortCtrl = ref(null)
+const _progressExpanded = ref(false)
+let _presetGenId = 0
+let _streamGenId = 0
+let _skipNextWatch = false
+let _timer = null
+
+function _startTimer() {
+  if (_timer) return
+  _timer = setInterval(() => {
+    const now = Date.now(), obj = {}
+    for (const [k, p] of Object.entries(_livePhases.value)) {
+      obj[k] = p.status === 'running' ? now - p.t0 : (p.t1 || now) - p.t0
+    }
+    _liveElapsed.value = obj
+  }, 200)
+}
+function _stopTimer() { if (_timer) { clearInterval(_timer); _timer = null } }
+</script>
+
+<script setup>
+import { ref, reactive, nextTick, computed, inject, watch, onMounted } from 'vue'
+import { askQueryStream, createConversation, addMessage, getMessages, filePreviewUrl, fileDownloadUrl, getTrace } from '@/api'
+import { renderMarkdown } from '@/utils/renderMarkdown'
+import PdfViewer from '@/components/PdfViewer.vue'
+import Spinner from '@/components/Spinner.vue'
+
+const convId = inject('convId')
+const loadConvs = inject('loadConvs')
+
+// Bind module-level refs to local names for template access
+const msgs = _msgs
+const streaming = _streaming
+const streamText = _streamText
+const retInfo = _retInfo
+const livePhases = _livePhases
+const liveElapsed = _liveElapsed
+const abortCtrl = _abortCtrl
+const progressExpanded = _progressExpanded
+
+// Per-instance state (OK to reset on remount)
+const input = ref('')
+const chatEl = ref(null)
+const pdf = reactive({ show: false, url: '', page: 1, highlights: [], cite: null, downloadUrl: '', sourceDownloadUrl: '', sourceLabel: '' })
+const trace = reactive({ show: false, data: null })
+const empty = computed(() => !msgs.value.length && !streaming.value)
+
+// On remount: reload messages from DB to ensure trace_id / citations are fresh.
+// The watch(convId) only fires on *change* — if convId is the same (e.g. user
+// clicked Chat tab to come back), the watch doesn't fire and we'd show stale data.
+onMounted(() => {
+  if (convId.value && !streaming.value) {
+    _loadAndPoll(convId.value)
+  }
+  nextTick(() => chatEl.value && (chatEl.value.scrollTop = chatEl.value.scrollHeight))
+})
+
+// Module-level aliases for closures
+const startTimer = _startTimer
+const stopTimer = _stopTimer
+
+const allPhasesSorted = computed(() =>
+  Object.entries(livePhases.value)
+    .sort((a, b) => a[1].t0 - b[1].t0)
+    .map(([name, p]) => ({ name, ...p }))
+)
+
+/** Current summary: what's running right now, as a single sentence */
+const progressSummary = computed(() => {
+  const running = allPhasesSorted.value.filter(p => p.status === 'running')
+  if (!running.length) {
+    const done = allPhasesSorted.value.filter(p => p.status === 'done')
+    if (done.length) {
+      const last = done[done.length - 1]
+      return { text: pLabel[last.name] || last.name, done: true, elapsed: liveElapsed.value[last.name] }
+    }
+    return null
+  }
+  const names = running.map(p => pLabel[p.name] || p.name)
+  // Show longest-running phase's elapsed time
+  const maxElapsed = Math.max(...running.map(p => liveElapsed.value[p.name] || 0))
+  return { text: names.join(', '), done: false, elapsed: maxElapsed }
+})
+
+const pLabel = {
+  query_understanding: 'Understanding query',
+  query_expansion: 'Expanding queries',
+  bm25_path: 'BM25 search',
+  vector_path: 'Vector search',
+  tree_path: 'Tree navigation',
+  kg_path: 'KG traversal',
+  rrf_merge: 'Merging',
+  expansion: 'Expanding context',
+  rerank: 'Reranking',
+  citations: 'Building citations',
+  generation: 'Generating',
+}
+
+/* ── Load conversation ── */
+let _pollTimer = null
+function stopPoll() { if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null } }
+
+watch(convId, async (id) => {
+  // When send() creates a new conversation, convId changes but we must NOT
+  // reset the UI — the user's message and streaming state are already set up.
+  if (_skipNextWatch) { _skipNextWatch = false; return }
+
+  // Cancel any in-progress preset streaming
+  _presetGenId++
+  // Detach any running API stream from UI (the request continues in background;
+  // backend persists the result via its own finally block).
+  _streamGenId++
+  streaming.value = false; streamText.value = ''; stopTimer(); stopPoll()
+  livePhases.value = {}; liveElapsed.value = {}
+  msgs.value = []; pdf.show = false; activeCiteId.value = null; trace.show = false
+  if (id) {
+    await _loadAndPoll(id)
+  }
+})
+
+/** Load messages from DB; if last msg is user (answer pending), poll until done */
+async function _loadAndPoll(id) {
+  function _parseRaw(raw) {
+    return raw.map(m => ({
+      role: m.role,
+      content: m.content,
+      citations: normalizeCitations(m.citations_json),
+      traceId: m.trace_id || null,
+    }))
+  }
+  try {
+    const raw = await getMessages(id)
+    msgs.value = _parseRaw(raw)
+    enrichHistoricalCitations()
+  } catch {}
+  scroll()
+
+  // If the last message is from the user, the backend is still processing.
+  // Show a waiting indicator and poll DB until the assistant reply lands.
+  const lastMsg = msgs.value[msgs.value.length - 1]
+  if (lastMsg?.role === 'user') {
+    streaming.value = true; streamText.value = ''
+    stopPoll()
+    _pollTimer = setInterval(async () => {
+      if (convId.value !== id) { stopPoll(); return }
+      try {
+        const raw = await getMessages(id)
+        const parsed = _parseRaw(raw)
+        const last = parsed[parsed.length - 1]
+        if (last?.role === 'assistant') {
+          // Answer arrived — update msgs and stop polling
+          stopPoll()
+          msgs.value = parsed
+          streaming.value = false; streamText.value = ''
+          enrichHistoricalCitations()
+          scroll()
+        }
+      } catch {}
+    }, 2000)
+  }
+}
+
+function normalizeCitations(raw) {
+  if (!raw?.length) return null
+  if (typeof raw[0] === 'object' && raw[0] !== null) return raw
+  return raw.map(id => (typeof id === 'string' ? { citation_id: id, _needsEnrich: true } : id))
+}
+
+async function enrichHistoricalCitations() {
+  for (const m of msgs.value) {
+    if (m.role !== 'assistant' || !m.traceId || !m.citations?.length) continue
+    const needsEnrich = m.citations.some(c => c._needsEnrich || !c.file_id)
+    if (!needsEnrich) continue
+    try {
+      const t = await getTrace(m.traceId)
+      const full = t.trace_json?.generation?.citations_full
+      if (!full?.length) continue
+      const lookup = Object.fromEntries(full.map(c => [c.citation_id, c]))
+      m.citations = m.citations.map(c => lookup[c.citation_id] || c)
+    } catch {}
+  }
+}
+
+const presetQA = [
+  {
+    q: 'What is ForgeRAG?',
+    a: `**ForgeRAG** is a self-hosted document Q&A system built on one principle: **"Don't just search. Reason. And show me where."**
+
+Most RAG systems treat documents as bags of chunks — they split text into fixed-size fragments, embed them, and hope the nearest vectors contain the answer. This works for simple lookups but falls apart when questions require understanding **where** information lives within a document's structure, or **how** entities relate across multiple documents.
+
+ForgeRAG takes a different approach.
+
+### Structural Tree Reasoning
+
+For every document ingested, ForgeRAG builds a **hierarchical tree** with per-node summaries using LLM-based page-group analysis. Pages are grouped into windows, and an LLM infers logical section boundaries, titles, and one-sentence summaries — all in a single call. Existing TOC and heading signals are passed as hints, but the LLM makes all structural decisions, ensuring reliable trees even for flat documents without headings.
+
+At query time, BM25 and vector search first identify "hot" regions in candidate documents. These hits are **annotated onto the tree outline** as heat-map markers. An LLM then reads the annotated outline (titles + summaries + hit markers) and reasons about which sections are truly relevant and which adjacent sections may also contain answers. This "verify + expand" approach is more accurate than blind exploration because the LLM starts from evidence, not from scratch.
+
+### Knowledge Graph & Multi-hop Reasoning
+
+During ingestion, ForgeRAG uses LLM-based extraction to build a knowledge graph of **entities and relations** from each chunk. At query time, this enables two retrieval modes:
+
+- **Local retrieval** — direct entity chunks + 1-hop and 2-hop neighbors in the graph
+- **Global retrieval** — keyword-based entity search across the entire graph
+
+This powers **multi-hop questions** that no keyword or vector search could answer: *"Which suppliers of Apple also supply Samsung?"* — the KG traverses Apple → supplier relations → shared entities → Samsung, discovering connections across documents.
+
+### Dual-Reasoning Retrieval
+
+Every query follows a two-phase retrieval pipeline:
+
+**Phase 1 — Fast Pre-filtering:** BM25 keyword matching and vector semantic search run in parallel to identify candidate documents and "hot" regions.
+
+**Phase 2 — Deep Reasoning:** Two reasoning paths operate on the pre-filtered results:
+
+| Path | What it does |
+|------|-------------|
+| **Tree Navigation** | LLM reads document outlines annotated with Phase 1 hits, verifies relevance and discovers adjacent sections |
+| **KG Traversal** | Graph walk — discovers entity relationships and cross-document links |
+
+Results are merged via **Reciprocal Rank Fusion (RRF)**. When tree navigation is unavailable, BM25/vector results enter RRF as fallback.
+
+### Pixel-precise Citations
+
+Every citation in ForgeRAG's answers carries **page number + bounding box coordinates**. The built-in PDF viewer highlights the exact source region — not just "page 5", but the specific paragraph, table cell, or figure caption the answer was derived from.
+
+### Forge Your RAG — From Simple to Sophisticated
+
+| Level | What you get | Config effort |
+|-------|-------------|---------------|
+| **Minimal** | BM25 + vector search, SQLite, local storage | Just set an API key |
+| **Standard** | + LLM tree navigation, query understanding, reranking | Enable in web UI |
+| **Advanced** | + KG extraction, multi-hop reasoning, VLM image enrichment | Toggle features on |
+| **Production** | + PostgreSQL/pgvector, S3, Neo4j, Docker one-click deploy | Setup wizard |
+
+Every component is independently toggleable. All settings — LLM providers, retrieval parameters, parsing strategies — are configurable **at runtime** through the web UI. No restart required.
+
+Upload PDFs, DOCX, PPTX, XLSX, HTML, or Markdown. Ask questions. Get grounded answers with highlighted source regions you can actually verify.`,
+  },
+  {
+    q: 'vs PageIndex',
+    a: `### ForgeRAG vs PageIndex
+
+Both reject the traditional "chunk-and-embed" paradigm in favor of **structure-aware reasoning** — using LLMs to navigate document hierarchies rather than relying solely on vector similarity. PageIndex (by VectifyAI) pioneered vectorless, reasoning-based RAG; ForgeRAG builds on this foundation and extends it significantly.
+
+| Dimension | **ForgeRAG** | **PageIndex** |
+|-----------|-------------|---------------|
+| **Core Idea** | Dual-reasoning: BM25/vector pre-filter → tree reasoning + KG | Pure reasoning-based: **no vector database**, no chunking |
+| **Retrieval** | BM25/vector pre-filter + tree + KG, fused via RRF | LLM tree navigation as the sole retrieval mechanism |
+| **Vector Search** | ✅ Pre-filter for tree navigation + fallback path | ❌ Deliberately eliminated — relies entirely on LLM reasoning |
+| **Tree Building** | LLM page-group inference with TOC/heading hints + per-node summaries | Hierarchical indexing with node-level summaries |
+| **Knowledge Graph** | Built-in entity/relation extraction + multi-hop traversal | None |
+| **Multi-hop** | Cross-document entity connections via KG graph traversal | Within-document structural navigation only |
+| **Citation** | Pixel-level bbox highlighting on PDF | Page / section level references |
+| **Deployment** | Web UI + REST API + Docker one-click deploy | Framework / SDK for integration |
+| **Performance** | Balanced latency (parallel paths, vector for speed) | Higher latency per query (LLM reasoning at every step) |
+| **Best For** | General-purpose document Q&A with full-stack deployment | Structured professional documents (finance, legal) where hierarchy is paramount |
+
+**Key insight:** PageIndex proves that LLM reasoning over document structure can outperform vector similarity (98.7% on FinanceBench). ForgeRAG incorporates this insight in its tree navigation path, but takes a different approach: BM25/vector pre-filter provides "hot region" hints that make the LLM's structural reasoning faster and more accurate than cold-start exploration. Even for flat documents without headings, the LLM infers section structure during indexing, making tree navigation universally applicable.`,
+  },
+  {
+    q: 'vs GraphRAG',
+    a: `### ForgeRAG vs GraphRAG (Microsoft)
+
+Both use **knowledge graphs** to enhance RAG, but their architectural philosophies are fundamentally different:
+
+| Dimension | **ForgeRAG** | **GraphRAG (Microsoft)** |
+|-----------|-------------|--------------------------|
+| **Retrieval Strategy** | BM25/vector pre-filter → tree reasoning + KG, fused via RRF | Graph-centric: community summaries + entities |
+| **Role of the Graph** | One of two primary reasoning paths (alongside tree nav), fused via RRF | Core and only retrieval mechanism |
+| **Document Structure** | LLM-built hierarchical tree with per-node summaries, heat-map guided navigation | No document structure awareness |
+| **Graph Construction** | Entity + relation extraction (per chunk, incremental) | Entity + relation + community detection + hierarchical summaries |
+| **Citations** | Pixel-level bbox, pinpoints exact document region | Community summary level, no precise location |
+| **Incremental Updates** | Document-level incremental, no full index rebuild | Requires rebuilding entire graph + communities |
+| **Configurability** | Every component independently toggleable, runtime hot-reload | Relatively fixed pipeline |
+| **Resource Cost** | Enable KG on demand — zero cost if unused | Must build full graph + community summaries upfront |
+
+**Key Differences:**
+
+1. **Complementary vs Dependent** — ForgeRAG's graph is one of two reasoning paths (alongside tree navigation); turn it off and retrieval still works via tree + BM25/vector fallback. GraphRAG's graph is the core; no graph, no retrieval
+2. **Structure + Semantics** — ForgeRAG understands both document structure (tree) and semantic relations (graph); GraphRAG has only the semantic graph
+3. **Precise Citations** — ForgeRAG traces back to the exact location in a document (pixel-level); GraphRAG traces to community summaries
+4. **Progressive** — ForgeRAG starts zero-config and grows with your needs; GraphRAG requires full graph construction before any query`,
+  },
+]
+
+async function send(text) {
+  const q = (text || input.value).trim(); if (!q || streaming.value) return; input.value = ''
+  if (!convId.value) try {
+    _skipNextWatch = true  // prevent watch from resetting UI on convId change
+    convId.value = (await createConversation(q.slice(0, 60))).conversation_id
+    loadConvs()  // refresh sidebar immediately so the new conversation is visible
+  } catch { _skipNextWatch = false }
+  msgs.value.push({ role: 'user', content: q })
+
+  // Check if this is a preset question — simulate fast streaming + persist
+  const preset = presetQA.find(p => p.q === q)
+  if (preset) {
+    const myGenId = ++_presetGenId
+    const cid = convId.value
+    streaming.value = true; streamText.value = ''
+    scroll()
+    const text = preset.a
+    const step = 8
+    for (let i = 0; i < text.length; i += step) {
+      if (myGenId !== _presetGenId) return  // cancelled by navigation
+      streamText.value = text.slice(0, i + step)
+      scroll()
+      await new Promise(r => setTimeout(r, 18))
+    }
+    if (myGenId !== _presetGenId) return  // cancelled
+    streamText.value = ''
+    msgs.value.push({ role: 'assistant', content: text, citations: null })
+    streaming.value = false
+    scroll()
+    // Persist both messages to backend
+    try {
+      await addMessage(cid, 'user', q)
+      await addMessage(cid, 'assistant', text)
+      loadConvs()
+    } catch {}
+    return
+  }
+
+  streaming.value = true; streamText.value = ''; retInfo.value = null
+  livePhases.value = {}; liveElapsed.value = {}; progressExpanded.value = false
+  startTimer(); scroll()
+
+  const myGenId = ++_streamGenId
+  abortCtrl.value = new AbortController()
+  try {
+    let fin = null
+    for await (const { event, data } of askQueryStream({ query: q, conversationId: convId.value, signal: abortCtrl.value.signal })) {
+      // If conversation switched away, stop updating UI but don't abort request
+      if (myGenId !== _streamGenId) break
+      if (event === 'progress') {
+        const { phase, status, detail } = data
+        const now = Date.now()
+        const ex = livePhases.value[phase]
+        if (status === 'running') {
+          livePhases.value = { ...livePhases.value, [phase]: { status: 'running', detail, t0: now } }
+        } else {
+          livePhases.value = { ...livePhases.value, [phase]: { status: 'done', detail, t0: ex?.t0 || now, t1: now } }
+        }
+        scroll()
+      } else if (event === 'retrieval') { retInfo.value = data }
+      else if (event === 'delta') { streamText.value += data.text; scroll() }
+      else if (event === 'error') {
+        const errMsg = typeof data === 'string' ? data : (data?.error || data?.detail || 'Unknown error')
+        fin = { text: `Error: ${errMsg}`, citations_used: null, stats: null, trace_id: null }
+      } else if (event === 'done') {
+        fin = data
+        if (livePhases.value.generation) {
+          livePhases.value = { ...livePhases.value, generation: { ...livePhases.value.generation, status: 'done', t1: Date.now() } }
+        }
+      }
+    }
+    if (fin && myGenId === _streamGenId) {
+      msgs.value.push({ role: 'assistant', content: fin.text, citations: fin.citations_used, stats: fin.stats, traceId: fin.trace_id || null })
+      streamText.value = ''
+    }
+  } catch (e) {
+    // AbortError from user clicking stop — not an error
+    if (e.name !== 'AbortError' && myGenId === _streamGenId) {
+      msgs.value.push({ role: 'assistant', content: `Error: ${e.message}` })
+    }
+    streamText.value = ''
+  }
+  finally {
+    if (myGenId === _streamGenId) { streaming.value = false; stopTimer() }
+    loadConvs()
+  }
+}
+
+function stopGeneration() {
+  if (abortCtrl.value) { abortCtrl.value.abort(); abortCtrl.value = null }
+  _presetGenId++
+  streaming.value = false; stopTimer(); stopPoll()
+  // Keep whatever streamed text we have as a partial message
+  if (streamText.value.trim()) {
+    msgs.value.push({ role: 'assistant', content: streamText.value, citations: null })
+    streamText.value = ''
+  }
+  loadConvs()
+}
+
+function scroll() { nextTick(() => chatEl.value && (chatEl.value.scrollTop = chatEl.value.scrollHeight)) }
+function onKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }
+function fmtSec(ms) { return ms == null ? '' : ms < 1000 ? '<1s' : Math.round(ms / 1000) + 's' }
+
+/* ── PDF ── */
+const activeCiteId = ref(null)    // citation_id for legacy compat
+const activeChunkId = ref(null)   // chunk_id — the real identity
+
+function onCiteClick(c) {
+  if (!c?.file_id) return
+
+  // Toggle: click same chunk again → close PDF & clear highlight
+  if (activeChunkId.value === c.chunk_id && pdf.show) {
+    pdf.show = false
+    activeCiteId.value = null
+    activeChunkId.value = null
+    return
+  }
+
+  activeCiteId.value = c.citation_id
+  activeChunkId.value = c.chunk_id
+  const hl = (c.highlights || []).map(h => {
+    const b = h.bbox
+    const bbox = Array.isArray(b) ? { x0: b[0], y0: b[1], x1: b[2], y1: b[3] } : b
+    return { page_no: h.page_no, bbox }
+  })
+
+  // Download URLs
+  const dlUrl = fileDownloadUrl(c.file_id)
+  const srcUrl = c.source_file_id ? fileDownloadUrl(c.source_file_id) : ''
+  const srcLabel = c.source_format ? c.source_format.toUpperCase() : ''
+
+  Object.assign(pdf, {
+    show: true,
+    url: filePreviewUrl(c.file_id),
+    page: c.page_no || 1,
+    highlights: hl,
+    cite: c,
+    downloadUrl: dlUrl,
+    sourceDownloadUrl: srcUrl,
+    sourceLabel: srcLabel,
+  })
+}
+
+/**
+ * Render assistant message to HTML with markdown/latex + citation tags.
+ * Citations become <span class="cite-tag" data-cite-idx="N" data-cite-id="c_1">[c_1]</span>
+ * so event delegation can handle clicks.
+ * Active state is NOT baked in — a watcher on activeCiteId toggles .cite-active via DOM.
+ */
+function renderMsg(text, cites) {
+  if (!text) return ''
+
+  // 1. Pull citation markers out BEFORE markdown/latex processing
+  //    so [c_1] isn't parsed as a markdown link reference.
+  //    Lookup by citation_id (e.g. "c_3") — NOT by array index,
+  //    because cites is a filtered subset (only citations the LLM used).
+  const citePH = []           // { idx, cid, chunkId, label }
+  let processed = text
+  if (cites?.length) {
+    // Build a map: citation_id → index in cites array (for click handling)
+    const citeMap = {}
+    cites.forEach((c, i) => { if (c?.citation_id) citeMap[c.citation_id] = i })
+
+    // Handle both [c_1] and [c_1, c_3, c_5] formats
+    processed = text.replace(/\[(c_\d+(?:\s*,\s*c_\d+)*)\]/g, (match, inner) => {
+      // Split "c_1, c_3, c_5" into individual citations
+      const cids = inner.split(/\s*,\s*/)
+      const parts = []
+      for (const cid of cids) {
+        const idx = citeMap[cid]
+        if (idx != null) {
+          const chunkId = cites[idx]?.chunk_id || ''
+          citePH.push({ idx, cid, chunkId, label: `[${cid}]` })
+          parts.push(`<!--CITE:${citePH.length - 1}-->`)
+        } else {
+          // Unknown citation — keep as plain text
+          parts.push(`[${cid}]`)
+        }
+      }
+      return parts.join('')
+    })
+  }
+
+  // 2. Render markdown + latex (HTML comments survive untouched)
+  let html = renderMarkdown(processed)
+
+  // 3. Replace comment placeholders with real HTML cite spans
+  html = html.replace(/<!--CITE:(\d+)-->/g, (_, i) => {
+    const p = citePH[parseInt(i)]
+    return `<span class="cite-tag" data-cite-idx="${p.idx}" data-cite-id="${p.cid}" data-chunk-id="${p.chunkId}">${p.label}</span>`
+  })
+  return html
+}
+
+/** Render streaming text with markdown/latex */
+function renderStream(text) {
+  if (!text) return ''
+  return renderMarkdown(text)
+}
+
+/** Event delegation handler for inline cite tag clicks */
+function onMsgClick(e, cites) {
+  const el = e.target.closest('.cite-tag[data-cite-idx]')
+  if (!el || !cites?.length) return
+  const idx = parseInt(el.dataset.citeIdx)
+  if (idx >= 0 && idx < cites.length) onCiteClick(cites[idx])
+}
+
+/** Sync activeChunkId → .cite-active class on inline cite tags via DOM.
+ *  Highlights by chunk_id across ALL messages — the same source chunk
+ *  lights up everywhere it's cited, regardless of citation_id label. */
+watch(activeChunkId, (newChunkId) => {
+  nextTick(() => {
+    const container = chatEl.value
+    if (!container) return
+    container.querySelectorAll('.cite-tag.cite-active').forEach(el => el.classList.remove('cite-active'))
+    if (newChunkId) {
+      container.querySelectorAll(`.cite-tag[data-chunk-id="${newChunkId}"]`).forEach(el => el.classList.add('cite-active'))
+    }
+  })
+})
+
+/* ── Trace ── */
+function fmtMs(ms) { return ms === 0 ? '<1' : ms == null ? '-' : String(ms) }
+
+function openTrace(stats) {
+  trace.data = stats?.retrieval?.trace || null
+  trace.generation = stats ? {
+    model: stats.retrieval?.trace?.generation?.model || null,
+    latency_ms: stats.generate_ms || 0,
+    context_chunks: stats.context_chunks || 0,
+  } : null
+  trace.show = true
+}
+
+async function openTraceById(traceId) {
+  if (!traceId) return
+  try {
+    const t = await getTrace(traceId)
+    trace.data = t.trace_json || null
+    trace.generation = t.trace_json?.generation ? {
+      model: t.answer_model || t.trace_json.generation.model,
+      latency_ms: t.trace_json.generation.latency_ms || 0,
+      context_chunks: t.trace_json.generation.context_chunks || 0,
+    } : null
+    trace.show = true
+  } catch (e) { console.warn('Failed to load trace:', e) }
+}
+
+function onTraceClick(m) {
+  if (trace.show) { trace.show = false; return }
+  if (m.stats) openTrace(m.stats)
+  else if (m.traceId) openTraceById(m.traceId)
+  else console.warn('No trace available for this message')
+}
+
+function buildPhaseGroups(phases) {
+  if (!phases?.length) return []
+  const sorted = [...phases].sort((a, b) => (a.started_at_ms || 0) - (b.started_at_ms || 0))
+  // Group phases that START within a small window of each other (truly parallel).
+  // This avoids grouping sequential phases (like Tree) with long-running parallel
+  // phases (like KG) just because their time ranges overlap.
+  const PARALLEL_WINDOW_MS = 100
+  const groups = []
+  let curGroup = { phases: [sorted[0]] }
+  for (let i = 1; i < sorted.length; i++) {
+    const p = sorted[i]
+    const groupStart = curGroup.phases[0].started_at_ms || 0
+    if ((p.started_at_ms || 0) - groupStart <= PARALLEL_WINDOW_MS) {
+      curGroup.phases.push(p)
+    } else {
+      groups.push(curGroup)
+      curGroup = { phases: [p] }
+    }
+  }
+  groups.push(curGroup)
+  return groups.map(g => ({ parallel: g.phases.length > 1, phases: g.phases }))
+}
+
+// Don't abort or stop timer on unmount — streaming state is module-level
+// and must survive component remount. Timer stops in stream's finally block.
+</script>
+
+<template>
+  <div class="flex h-full">
+    <!-- ═══════ Trace panel ═══════ -->
+    <Transition name="slide-trace">
+      <div v-if="trace.show" class="w-72 shrink-0 border-r border-line flex flex-col bg-bg overflow-hidden">
+        <div class="flex-none flex items-center justify-between px-4 py-2.5 border-b border-line">
+          <span class="text-[11px] text-t1 font-medium">Retrieval Trace</span>
+          <button @click="trace.show = false" class="p-1 text-t3 hover:text-t1 rounded hover:bg-bg-hover transition-colors">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto px-4 py-3">
+          <template v-if="trace.data">
+            <div class="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-t3 mb-4 pb-3 border-b border-line">
+              <span><b class="text-t2">{{ fmtMs(trace.data.total_ms) }}</b>ms total</span>
+              <span><b class="text-t2">{{ trace.data.total_llm_calls || 0 }}</b> LLM calls</span>
+              <span v-if="trace.data.total_llm_ms"><b class="text-t2">{{ fmtMs(trace.data.total_llm_ms) }}</b>ms LLM</span>
+            </div>
+
+            <div class="space-y-2">
+              <template v-for="(group, gi) in buildPhaseGroups(trace.data.phases)" :key="gi">
+                <div v-if="group.parallel" class="relative pl-3 border-l-2 border-brand/30 mb-1">
+                  <div class="absolute -left-[5px] top-0 w-2 h-2 rounded-full bg-brand/40"></div>
+                  <div class="text-[8px] text-brand/60 uppercase tracking-wider mb-1.5 font-medium">parallel</div>
+                  <div class="space-y-2">
+                    <div v-for="p in group.phases" :key="p.name" class="py-1">
+                      <div class="flex items-center justify-between">
+                        <span class="text-[10px] text-t1 font-medium">{{ p.name }}</span>
+                        <span class="text-[9px] text-t3 font-mono tabular-nums">{{ fmtMs(p.duration_ms) }}ms</span>
+                      </div>
+                      <div class="h-1 rounded-full mt-1 bg-bg3 relative">
+                        <div class="h-full rounded-full bg-brand/60 absolute top-0"
+                          :style="{ left: ((p.started_at_ms||0)/(trace.data.total_ms||1)*100)+'%', width: Math.max(2,(p.duration_ms||0)/(trace.data.total_ms||1)*100)+'%' }"></div>
+                      </div>
+                      <div v-if="p.outputs && Object.keys(p.outputs).length" class="mt-1 space-y-px">
+                        <div v-for="(v, k) in p.outputs" :key="k" class="text-[9px] text-t3 flex justify-between">
+                          <span>{{ k }}</span><span class="text-t2 font-mono">{{ v }}</span>
+                        </div>
+                      </div>
+                      <div v-if="p.llm_calls?.length" class="mt-1 space-y-0.5">
+                        <div v-for="(lc, li) in p.llm_calls" :key="li" class="text-[9px] flex items-center gap-2 text-t3">
+                          <span class="text-brand/70 text-[8px] font-medium">LLM</span>
+                          <span class="truncate flex-1">{{ lc.purpose || lc.model }}</span>
+                          <span class="text-t2 font-mono shrink-0">{{ fmtMs(lc.latency_ms) }}ms</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-else v-for="p in group.phases" :key="p.name" class="py-1">
+                  <div class="flex items-center justify-between">
+                    <span class="text-[10px] text-t1 font-medium">{{ p.name }}</span>
+                    <span class="text-[9px] text-t3 font-mono tabular-nums">{{ fmtMs(p.duration_ms) }}ms</span>
+                  </div>
+                  <div class="h-1 rounded-full mt-1 bg-bg3 relative">
+                    <div class="h-full rounded-full bg-brand absolute top-0"
+                      :style="{ left: ((p.started_at_ms||0)/(trace.data.total_ms||1)*100)+'%', width: Math.max(2,(p.duration_ms||0)/(trace.data.total_ms||1)*100)+'%' }"></div>
+                  </div>
+                  <div v-if="p.outputs && Object.keys(p.outputs).length" class="mt-1 space-y-px">
+                    <div v-for="(v, k) in p.outputs" :key="k" class="text-[9px] text-t3 flex justify-between">
+                      <span>{{ k }}</span><span class="text-t2 font-mono">{{ v }}</span>
+                    </div>
+                  </div>
+                  <div v-if="p.llm_calls?.length" class="mt-1 space-y-0.5">
+                    <div v-for="(lc, li) in p.llm_calls" :key="li" class="text-[9px] flex items-center gap-2 text-t3">
+                      <span class="text-brand/70 text-[8px] font-medium">LLM</span>
+                      <span class="truncate flex-1">{{ lc.purpose || lc.model }}</span>
+                      <span class="text-t2 font-mono shrink-0">{{ fmtMs(lc.latency_ms) }}ms</span>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </div>
+
+            <div v-if="trace.generation" class="mt-4 pt-3 border-t border-line">
+              <div class="text-[9px] text-t3 uppercase tracking-widest mb-1.5 font-medium">Generation</div>
+              <div class="space-y-px text-[9px]">
+                <div v-if="trace.generation.model" class="flex justify-between text-t3">
+                  <span>model</span><span class="text-t2 font-mono">{{ trace.generation.model }}</span>
+                </div>
+                <div class="flex justify-between text-t3">
+                  <span>latency</span><span class="text-t2 font-mono">{{ fmtMs(trace.generation.latency_ms) }}ms</span>
+                </div>
+                <div class="flex justify-between text-t3">
+                  <span>context chunks</span><span class="text-t2 font-mono">{{ trace.generation.context_chunks }}</span>
+                </div>
+              </div>
+            </div>
+          </template>
+          <div v-else class="text-[10px] text-t3 text-center py-6">No trace data available</div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- ═══════ Chat main ═══════ -->
+    <div class="flex-1 flex flex-col min-w-0">
+
+      <!-- EMPTY STATE -->
+      <div v-if="empty" class="flex-1 flex flex-col">
+        <div class="flex-[3]"></div>
+        <div class="pl-8 pr-16">
+          <div class="max-w-2xl mx-auto text-center">
+            <img src="/text_logo.png" alt="ForgeRAG" class="h-8 mx-auto mb-3" />
+            <p class="text-sm text-t3 mb-8">Multi-path fusion · Tree reasoning · Knowledge graph · Pixel-precise citations</p>
+            <div class="flex flex-wrap justify-center gap-2 mb-10">
+              <button v-for="p in presetQA" :key="p.q" @click="send(p.q)"
+                class="px-4 py-2 rounded-full border border-line text-xs text-t2 hover:bg-bg3 hover:border-line2 transition-colors"
+              >{{ p.q }}</button>
+            </div>
+          </div>
+        </div>
+        <div class="flex-[4]"></div>
+        <div class="pl-8 pr-16 pb-6">
+          <div class="max-w-2xl mx-auto">
+            <div class="flex items-end gap-3 px-4 py-3 rounded-xl border border-line shadow-sm bg-bg">
+              <textarea v-model="input" @keydown="onKey" placeholder="Ask a question..." rows="2"
+                class="flex-1 bg-transparent border-none outline-none resize-none text-sm text-t1 leading-relaxed"
+                style="min-height: 40px; max-height: 120px" autofocus />
+              <button @click="send()" :disabled="!input.trim()"
+                class="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 transition-colors"
+                :class="input.trim() ? 'bg-brand text-white' : 'bg-bg3 text-t3'">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+              </button>
+            </div>
+            <div class="text-center mt-2 text-[10px] text-t3">ForgeRAG may make mistakes. Verify important information.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- MESSAGES -->
+      <template v-else>
+        <div ref="chatEl" class="flex-1 overflow-y-auto pl-6 pr-14 py-6">
+          <div class="max-w-2xl mx-auto space-y-4">
+            <div v-for="(m, i) in msgs" :key="i" class="fadein">
+              <!-- User -->
+              <div v-if="m.role === 'user'" class="flex justify-end mb-2">
+                <div class="px-4 py-2.5 rounded-2xl text-sm bg-bg3 text-t1 max-w-[75%]">{{ m.content }}</div>
+              </div>
+              <!-- Assistant -->
+              <div v-else class="group mb-2">
+                <div class="msg-body text-sm leading-7 text-t1 max-w-[90%]"
+                  v-html="renderMsg(m.content, m.citations)"
+                  @click="onMsgClick($event, m.citations)">
+                </div>
+                <div v-if="m.citations?.length" class="flex flex-wrap gap-1.5 mt-3">
+                  <button v-for="(c, ci) in m.citations" :key="ci"
+                    class="flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[10px] transition-colors"
+                    :class="activeChunkId === c.chunk_id
+                      ? 'border-brand bg-brand/10 text-brand'
+                      : 'border-line text-t2 hover:bg-bg3'"
+                    @click="onCiteClick(c)">
+                    <span class="font-medium" :class="activeChunkId === c.chunk_id ? '' : 'text-brand'">{{ c.citation_id }}</span>
+                    <span v-if="c.page_no" class="text-t3">p{{ c.page_no }}</span>
+                    <span v-if="c.chunk_id" class="text-t3 font-mono truncate max-w-48">{{ c.chunk_id }}</span>
+                  </button>
+                </div>
+                <button v-if="m.role === 'assistant' && (m.stats || m.traceId)"
+                  class="mt-1.5 text-[10px] text-t3 invisible group-hover:visible flex items-center gap-1"
+                  @click="onTraceClick(m)">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10M18 20V4M6 20v-4"/></svg>
+                  Trace
+                </button>
+              </div>
+            </div>
+
+            <!-- ═══ Streaming: lightweight progress ═══ -->
+            <div v-if="streaming" class="fadein">
+              <div v-if="!streamText" class="text-[12px] text-t3 leading-6">
+                <!-- No phases yet -->
+                <template v-if="!Object.keys(livePhases).length">
+                  <Spinner size="sm" />
+                </template>
+
+                <template v-else>
+                  <!-- Summary line (always visible): "Searching... 3.2s ▾" -->
+                  <span v-if="progressSummary && !progressSummary.done" class="text-t2">
+                    <span class="text-t3">Thinking:</span> {{ progressSummary.text }}...
+                    <span class="text-t3 text-[11px] ml-1.5">{{ fmtSec(progressSummary.elapsed) }}</span>
+                  </span>
+                  <span v-else-if="progressSummary && progressSummary.done" class="text-t3">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" class="inline -mt-px mr-0.5 text-t1">
+                      <path d="M20 6L9 17l-5-5" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <span class="text-t3/60">Thinking:</span> {{ progressSummary.text }}
+                    <span class="text-[11px] ml-1.5">{{ fmtSec(progressSummary.elapsed) }}</span>
+                  </span>
+
+                  <!-- Expand toggle -->
+                  <button class="ml-1 text-t3/50 hover:text-t3 align-middle" @click="progressExpanded = !progressExpanded">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                      class="inline transition-transform" :class="progressExpanded ? 'rotate-180' : ''">
+                      <path d="M6 9l6 6 6-6"/>
+                    </svg>
+                  </button>
+
+                  <!-- Expanded detail (each phase as inline text) -->
+                  <div v-if="progressExpanded" class="mt-1 text-[11px] text-t3 leading-5">
+                    <div v-for="p in allPhasesSorted" :key="p.name" class="phase-in">
+                      <template v-if="p.status === 'done'">
+                        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" class="inline -mt-px mr-0.5 text-t1">
+                          <path d="M20 6L9 17l-5-5" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        {{ pLabel[p.name] || p.name }}
+                        <span v-if="p.detail" class="text-t3/50 ml-1">{{ p.detail }}</span>
+                        <span class="text-t3/40 text-[10px] ml-1.5">{{ fmtSec(liveElapsed[p.name]) }}</span>
+                      </template>
+                      <template v-else>
+                        <Spinner size="xs" class="mr-0.5 -mt-px" />
+                        <span class="text-t2">{{ pLabel[p.name] || p.name }}</span>
+                        <span class="text-t3/40 text-[10px] ml-1.5">{{ fmtSec(liveElapsed[p.name]) }}</span>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+              </div>
+
+              <!-- Streaming text -->
+              <div v-if="streamText" class="msg-body text-sm leading-7 text-t1">
+                <span v-html="renderStream(streamText)"></span><span class="inline-block w-0.5 h-4 ml-0.5 bg-brand animate-pulse rounded-sm"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Bottom input -->
+        <div class="pl-6 pr-14 pb-4 border-t border-line bg-bg">
+          <div class="max-w-2xl mx-auto pt-3">
+            <div class="flex items-end gap-3 px-4 py-2.5 rounded-xl border border-line bg-bg">
+              <textarea v-model="input" :disabled="streaming" @keydown="onKey" placeholder="Ask a follow-up..." rows="1"
+                class="flex-1 bg-transparent border-none outline-none resize-none text-sm text-t1 leading-relaxed"
+                style="min-height: 20px; max-height: 80px"
+                @input="$event.target.style.height='auto';$event.target.style.height=$event.target.scrollHeight+'px'" />
+              <!-- Stop button while streaming -->
+              <button v-if="streaming" @click="stopGeneration()"
+                class="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 bg-bg3 hover:bg-bg3/80 text-t1 transition-colors"
+                title="Stop generation">
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+              </button>
+              <!-- Send button -->
+              <button v-else @click="send()" :disabled="!input.trim()"
+                class="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 transition-colors"
+                :class="input.trim() ? 'bg-brand text-white' : 'bg-bg3 text-t3'">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- ═══════ PDF panel ═══════ -->
+    <Transition name="slide-pdf">
+      <div v-if="pdf.show" class="w-[45%] max-w-[620px] min-w-[400px] shrink-0 border-l border-line flex flex-col overflow-hidden">
+        <div class="flex-none flex items-center justify-between px-3 py-2 border-b border-line">
+          <div class="flex items-center gap-2 text-xs text-t3">
+            <span>Page {{ pdf.page }}</span>
+            <span v-if="pdf.cite" class="text-brand">{{ pdf.cite.citation_id }}</span>
+          </div>
+          <button @click="pdf.show = false; activeCiteId = null" class="p-1 text-t3 hover:text-t1 rounded hover:bg-bg-hover transition-colors">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <PdfViewer :url="pdf.url" :page="pdf.page" :highlight-blocks="pdf.highlights"
+          :downloadUrl="pdf.downloadUrl" :sourceDownloadUrl="pdf.sourceDownloadUrl" :sourceLabel="pdf.sourceLabel"
+          class="flex-1" />
+      </div>
+    </Transition>
+  </div>
+</template>
+
+<style scoped>
+.fadein { animation: fadein .2s ease; }
+@keyframes fadein { from { opacity: 0; transform: translateY(4px) } }
+
+/* ── Markdown body styles ── */
+.msg-body :deep(p) { margin: 0.4em 0; }
+.msg-body :deep(p:first-child) { margin-top: 0; }
+.msg-body :deep(p:last-child) { margin-bottom: 0; }
+.msg-body :deep(h1),
+.msg-body :deep(h2),
+.msg-body :deep(h3),
+.msg-body :deep(h4) { font-weight: 600; margin: 0.8em 0 0.3em; line-height: 1.4; }
+.msg-body :deep(h1) { font-size: 1.25em; }
+.msg-body :deep(h2) { font-size: 1.15em; }
+.msg-body :deep(h3) { font-size: 1.05em; }
+.msg-body :deep(ul),
+.msg-body :deep(ol) { padding-left: 1.5em; margin: 0.4em 0; }
+.msg-body :deep(li) { margin: 0.15em 0; }
+.msg-body :deep(ul) { list-style: disc; }
+.msg-body :deep(ol) { list-style: decimal; }
+.msg-body :deep(blockquote) {
+  border-left: 3px solid var(--color-line, #ddd); padding-left: 0.8em;
+  margin: 0.5em 0; color: var(--color-t2, #666);
+}
+.msg-body :deep(code) {
+  font-family: 'IBM Plex Mono', 'SF Mono', 'Consolas', monospace;
+  font-size: 0.85em; padding: 0.15em 0.35em; border-radius: 4px;
+  background: var(--color-bg3, #f0f0f0);
+}
+.msg-body :deep(pre) {
+  margin: 0.5em 0; padding: 0.75em 1em; border-radius: 8px;
+  background: var(--color-bg3, #f0f0f0); overflow-x: auto;
+  font-size: 0.82em; line-height: 1.5;
+}
+.msg-body :deep(pre code) {
+  padding: 0; background: none; font-size: inherit;
+}
+.msg-body :deep(table) {
+  border-collapse: collapse; margin: 0.5em 0; font-size: 0.9em; width: auto;
+}
+.msg-body :deep(th),
+.msg-body :deep(td) {
+  border: 1px solid var(--color-line, #ddd); padding: 0.35em 0.65em; text-align: left;
+}
+.msg-body :deep(th) { background: var(--color-bg3, #f0f0f0); font-weight: 600; }
+.msg-body :deep(hr) { border: none; border-top: 1px solid var(--color-line, #ddd); margin: 0.8em 0; }
+.msg-body :deep(a) { color: var(--color-brand, #3d3d3d); text-decoration: underline; }
+.msg-body :deep(strong) { font-weight: 600; }
+.msg-body :deep(img) { max-width: 100%; border-radius: 6px; }
+
+/* KaTeX overrides */
+.msg-body :deep(.katex-display) { margin: 0.5em 0; overflow-x: auto; }
+.msg-body :deep(.katex) { font-size: 1em; }
+
+/* cite-tag lives inside v-html, so needs :deep() under scoped styles */
+.msg-body :deep(.cite-tag) {
+  display: inline; padding: 1px 5px; margin: 0 1px; border-radius: 4px;
+  font-size: 10px; font-weight: 600;
+  color: var(--color-brand, #3d3d3d); background: var(--color-bg3, #f0f0f0);
+  cursor: pointer; transition: background .15s;
+}
+.msg-body :deep(.cite-tag:hover) { background: var(--color-line2, #ddd); }
+.msg-body :deep(.cite-tag.cite-active) { background: var(--color-brand, #3d3d3d); color: #fff; }
+
+
+.phase-in { animation: phaseIn .15s ease; }
+@keyframes phaseIn { from { opacity: 0; } to { opacity: 1; } }
+
+.slide-trace-enter-active, .slide-trace-leave-active { transition: width .2s cubic-bezier(.4,0,.2,1), opacity .2s ease; }
+.slide-trace-enter-from, .slide-trace-leave-to { width: 0 !important; opacity: 0; }
+.slide-pdf-enter-active, .slide-pdf-leave-active { transition: width .2s cubic-bezier(.4,0,.2,1), opacity .2s ease; }
+.slide-pdf-enter-from, .slide-pdf-leave-to { width: 0 !important; opacity: 0; }
+</style>

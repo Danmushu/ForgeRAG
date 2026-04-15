@@ -1,0 +1,376 @@
+"""
+REST API request/response schemas.
+
+All responses follow a consistent shape:
+    - Single resource: the resource object directly
+    - List resource:   { items: [...], total: N, limit: N, offset: N }
+    - Mutation result: { id: "...", status: "..." } or the updated resource
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Pagination wrapper
+# ---------------------------------------------------------------------------
+
+
+class PaginatedResponse(BaseModel):
+    items: list[Any]
+    total: int
+    limit: int
+    offset: int
+
+
+# ---------------------------------------------------------------------------
+# Files
+# ---------------------------------------------------------------------------
+
+
+class FileOut(BaseModel):
+    file_id: str
+    content_hash: str
+    original_name: str
+    display_name: str
+    size_bytes: int
+    mime_type: str
+    uploaded_at: Any
+
+
+class UploadUrlRequest(BaseModel):
+    url: str
+    original_name: str | None = None
+    mime_type: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Documents
+# ---------------------------------------------------------------------------
+
+
+class IngestRequest(BaseModel):
+    file_id: str
+    doc_id: str | None = None
+    parse_version: int = 1
+    enrich_summary: bool | None = None
+    force_reparse: bool = False
+
+
+class DocumentOut(BaseModel):
+    doc_id: str
+    file_id: str | None = None
+    pdf_file_id: str | None = None
+    filename: str = ""
+    format: str
+    active_parse_version: int
+    doc_profile_json: dict | None = None
+    parse_trace_json: dict | None = None
+    metadata_json: dict | None = None
+    created_at: Any = None
+    updated_at: Any = None
+    # Processing status
+    status: str = "pending"
+    error_message: str | None = None
+    embed_status: str = "pending"
+    embed_provider_id: str | None = None
+    embed_model: str | None = None
+    embed_at: Any = None
+    enrich_status: str = "pending"
+    enrich_provider_id: str | None = None
+    enrich_model: str | None = None
+    enrich_summary_count: int = 0
+    enrich_image_count: int = 0
+    enrich_at: Any = None
+    # Per-phase timing
+    parse_started_at: Any = None
+    parse_completed_at: Any = None
+    structure_started_at: Any = None
+    structure_completed_at: Any = None
+    enrich_started_at: Any = None
+    embed_started_at: Any = None
+    # Knowledge Graph
+    kg_status: Any = None
+    kg_provider_id: str | None = None
+    kg_model: str | None = None
+    kg_entity_count: Any = None
+    kg_relation_count: Any = None
+    kg_started_at: Any = None
+    kg_completed_at: Any = None
+    # Enriched fields (filled by the route, not the store)
+    num_blocks: int | None = None
+    num_chunks: int | None = None
+    file_name: str | None = None
+    file_size_bytes: int | None = None
+
+
+class IngestResponse(BaseModel):
+    file_id: str
+    doc_id: str
+    parse_version: int
+    num_blocks: int
+    num_chunks: int
+    tree_quality: float
+
+
+class IngestAcceptedResponse(BaseModel):
+    """Returned when ingestion is queued for background processing."""
+
+    file_id: str
+    doc_id: str
+    status: str = "pending"
+    message: str = "queued for processing"
+
+
+# ---------------------------------------------------------------------------
+# Blocks
+# ---------------------------------------------------------------------------
+
+
+class BlockOut(BaseModel):
+    block_id: str
+    doc_id: str
+    parse_version: int
+    page_no: int
+    seq: int
+    bbox: dict = Field(description="x0, y0, x1, y1")
+    type: str
+    level: int | None = None
+    text: str
+    confidence: float
+    table_html: str | None = None
+    table_markdown: str | None = None
+    figure_storage_key: str | None = None
+    figure_caption: str | None = None
+    formula_latex: str | None = None
+    excluded: bool
+    excluded_reason: str | None = None
+    caption_of: str | None = None
+    cross_ref_targets: list[str] = []
+
+
+# ---------------------------------------------------------------------------
+# Chunks
+# ---------------------------------------------------------------------------
+
+
+class ChunkOut(BaseModel):
+    chunk_id: str
+    doc_id: str
+    parse_version: int
+    node_id: str
+    content: str
+    content_type: str
+    block_ids: list[str]
+    page_start: int
+    page_end: int
+    token_count: int
+    section_path: list[str]
+    ancestor_node_ids: list[str]
+    cross_ref_chunk_ids: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Tree
+# ---------------------------------------------------------------------------
+
+
+class TreeNodeOut(BaseModel):
+    node_id: str
+    parent_id: str | None = None
+    level: int
+    title: str
+    page_start: int
+    page_end: int
+    children: list[str]
+    block_ids: list[str]
+    element_types: list[str]
+    table_count: int
+    figure_count: int
+    summary: str | None = None
+    key_entities: list[str] = []
+
+
+class TreeOut(BaseModel):
+    doc_id: str
+    parse_version: int
+    root_id: str
+    quality_score: float
+    generation_method: str
+    nodes: dict[str, TreeNodeOut]
+
+
+# ---------------------------------------------------------------------------
+# Query
+# ---------------------------------------------------------------------------
+
+
+class QueryRequest(BaseModel):
+    query: str
+    filter: dict[str, Any] | None = None
+    conversation_id: str | None = Field(
+        None,
+        description=(
+            "Pass a conversation_id to continue a multi-turn chat. "
+            "Omit or null to start a new standalone query. "
+            "If the id doesn't exist yet, a new conversation is auto-created."
+        ),
+    )
+    stream: bool = Field(
+        False,
+        description="If true, return a text/event-stream SSE response.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Conversations
+# ---------------------------------------------------------------------------
+
+
+class ConversationOut(BaseModel):
+    conversation_id: str
+    title: str | None = None
+    created_at: Any = None
+    updated_at: Any = None
+    message_count: int | None = None
+
+
+class MessageOut(BaseModel):
+    message_id: str
+    conversation_id: str
+    role: str
+    content: str
+    trace_id: str | None = None
+    citations_json: list | None = None
+    created_at: Any = None
+
+
+class HighlightOut(BaseModel):
+    page_no: int
+    bbox: tuple[float, float, float, float]
+
+
+class CitationOut(BaseModel):
+    citation_id: str
+    doc_id: str
+    file_id: str | None = None
+    source_file_id: str | None = None
+    source_format: str = ""
+    parse_version: int
+    page_no: int
+    highlights: list[HighlightOut]
+    snippet: str
+    score: float
+    open_url: str | None = None
+
+
+class QueryResponse(BaseModel):
+    query: str
+    text: str
+    citations_used: list[CitationOut]
+    citations_all: list[CitationOut]
+    model: str
+    finish_reason: str
+    stats: dict[str, Any]
+    trace: dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Traces
+# ---------------------------------------------------------------------------
+
+
+class TraceSummaryOut(BaseModel):
+    trace_id: str
+    query: str
+    timestamp: Any
+    total_ms: int
+    total_llm_ms: int
+    total_llm_calls: int
+    answer_model: str | None = None
+    finish_reason: str | None = None
+    citations_used: list[str]
+
+
+class TraceDetailOut(TraceSummaryOut):
+    answer_text: str | None = None
+    trace_json: dict[str, Any]
+    metadata_json: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+
+class SettingOut(BaseModel):
+    key: str
+    value_json: Any
+    group_name: str
+    label: str
+    description: str | None = None
+    value_type: str
+    enum_options: list | None = None
+    default_value: str | None = None
+    updated_at: Any = None
+
+
+class SettingUpdate(BaseModel):
+    value_json: Any
+
+
+class SettingsBatchUpdate(BaseModel):
+    settings: list[dict[str, Any]]
+
+
+class SettingsGrouped(BaseModel):
+    groups: dict[str, list[SettingOut]]
+
+
+# ---------------------------------------------------------------------------
+# LLM Providers
+# ---------------------------------------------------------------------------
+
+
+class LLMProviderCreate(BaseModel):
+    name: str
+    provider_type: str = Field(description="chat / embedding / reranker")
+    api_base: str | None = None
+    model_name: str = Field(description="litellm model string, e.g. openai/gpt-4o")
+    api_key: str | None = None
+    is_default: bool = False
+
+
+class LLMProviderUpdate(BaseModel):
+    name: str | None = None
+    provider_type: str | None = None
+    api_base: str | None = None
+    model_name: str | None = None
+    api_key: str | None = None
+    is_default: bool | None = None
+
+
+class LLMProviderOut(BaseModel):
+    id: str
+    name: str
+    provider_type: str
+    api_base: str | None = None
+    model_name: str
+    api_key_set: bool = Field(description="True if an API key is configured (key itself not exposed)")
+    is_default: bool = False
+    created_at: Any = None
+    updated_at: Any = None
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+
+class HealthResponse(BaseModel):
+    status: str
+    version: str = "1"
+    components: dict[str, str]
+    counts: dict[str, int] | None = None

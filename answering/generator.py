@@ -1,0 +1,261 @@
+"""
+LLM-backed answer generator.
+
+The Generator takes a pre-built message list (from prompts.py) and
+returns the raw answer text, the cited marker ids, and LLM metadata.
+Wrapping the litellm call in a Protocol means tests can inject a
+fake generator without touching network code.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import time
+from typing import Any, Protocol
+
+from config import GeneratorConfig
+
+from .prompts import extract_cited_ids
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Protocol + factory
+# ---------------------------------------------------------------------------
+
+
+class Generator(Protocol):
+    backend: str
+    model: str
+
+    def generate(self, messages: list[dict]) -> dict:
+        """
+        Return a dict with keys:
+            text:          str
+            finish_reason: str
+            usage:         dict | None
+            model:         str
+            cited_ids:     list[str]   (parsed from text)
+        """
+        ...
+
+    def generate_stream(self, messages: list[dict]):
+        """
+        Yield dicts with keys:
+            type:   "delta" | "done"
+            delta:  str  (text fragment, only for type="delta")
+            text:   str  (full text, only for type="done")
+            finish_reason: str (only for type="done")
+            usage:  dict | None (only for type="done")
+            model:  str
+            cited_ids: list[str] (only for type="done")
+        """
+        ...
+
+
+def make_generator(cfg: GeneratorConfig) -> Generator:
+    if cfg.backend == "litellm":
+        return LiteLLMGenerator(cfg)
+    raise ValueError(f"unknown generator backend: {cfg.backend!r}")
+
+
+# ---------------------------------------------------------------------------
+# LiteLLM implementation
+# ---------------------------------------------------------------------------
+
+
+class LiteLLMGenerator:
+    backend = "litellm"
+
+    def __init__(self, cfg: GeneratorConfig):
+        self.cfg = cfg
+        self.model = cfg.model
+        self._litellm = None
+
+    # ------------------------------------------------------------------
+    def _ensure(self):
+        if self._litellm is not None:
+            return self._litellm
+        try:
+            import litellm
+        except ImportError as e:
+            raise RuntimeError("LiteLLMGenerator requires litellm: pip install litellm") from e
+        from config.auth import resolve_api_key
+
+        self._api_key = resolve_api_key(
+            api_key=self.cfg.api_key,
+            api_key_env=self.cfg.api_key_env,
+            required=False,
+            context="answering.generator",
+        )
+        self._litellm = litellm
+        return litellm
+
+    # ------------------------------------------------------------------
+    def generate(self, messages: list[dict]) -> dict:
+        litellm = self._ensure()
+        kwargs: dict[str, Any] = dict(
+            model=self.cfg.model,
+            messages=messages,
+            temperature=self.cfg.temperature,
+            max_tokens=self.cfg.max_tokens,
+            timeout=self.cfg.timeout,
+        )
+        if self.cfg.api_base:
+            kwargs["api_base"] = self.cfg.api_base
+
+        if self._api_key:
+            kwargs["api_key"] = self._api_key
+
+        max_retries = getattr(self.cfg, "max_retries", 3)
+        retry_delay = getattr(self.cfg, "retry_base_delay", 1.0)
+        last_err = None
+        t0 = time.time()
+        for attempt in range(max_retries):
+            try:
+                resp = litellm.completion(**kwargs)
+                text = _extract_text(resp)
+                finish = _extract_finish_reason(resp)
+                usage = _extract_usage(resp)
+                cited = extract_cited_ids(text)
+
+                return {
+                    "text": text,
+                    "finish_reason": finish,
+                    "usage": usage,
+                    "model": self.cfg.model,
+                    "cited_ids": cited,
+                    "latency_ms": int((time.time() - t0) * 1000),
+                }
+            except Exception as e:
+                last_err = e
+                log.warning(
+                    "generator LLM call attempt %d/%d failed: %s",
+                    attempt + 1,
+                    max_retries,
+                    e,
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (2**attempt))
+
+        log.error("generator LLM call failed after %d retries: %s", max_retries, last_err)
+        return {
+            "text": "",
+            "finish_reason": "error",
+            "usage": None,
+            "model": self.cfg.model,
+            "cited_ids": [],
+            "error": str(last_err),
+            "latency_ms": int((time.time() - t0) * 1000),
+        }
+
+    # ------------------------------------------------------------------
+    def generate_stream(self, messages: list[dict]):
+        litellm = self._ensure()
+        kwargs: dict[str, Any] = dict(
+            model=self.cfg.model,
+            messages=messages,
+            temperature=self.cfg.temperature,
+            max_tokens=self.cfg.max_tokens,
+            timeout=self.cfg.timeout,
+            stream=True,
+        )
+        if self._api_key:
+            kwargs["api_key"] = self._api_key
+        if self.cfg.api_base:
+            kwargs["api_base"] = self.cfg.api_base
+
+        full_text = ""
+        try:
+            resp = litellm.completion(**kwargs)
+            finish_reason = "stop"
+            for chunk in resp:
+                delta = ""
+                with contextlib.suppress(AttributeError, IndexError):
+                    delta = chunk.choices[0].delta.content or ""
+                fr = (
+                    getattr(chunk.choices[0], "finish_reason", None)
+                    if getattr(chunk, "choices", None) and len(chunk.choices) > 0
+                    else None
+                )
+                if fr:
+                    finish_reason = fr
+                if delta:
+                    full_text += delta
+                    yield {
+                        "type": "delta",
+                        "delta": delta,
+                        "model": self.cfg.model,
+                    }
+
+            cited = extract_cited_ids(full_text)
+            yield {
+                "type": "done",
+                "text": full_text,
+                "finish_reason": finish_reason,
+                "usage": None,
+                "model": self.cfg.model,
+                "cited_ids": cited,
+            }
+        except Exception as e:
+            log.error("generator stream failed: %s", e)
+            yield {
+                "type": "done",
+                "text": full_text,
+                "finish_reason": "error",
+                "usage": None,
+                "model": self.cfg.model,
+                "cited_ids": extract_cited_ids(full_text),
+                "error": str(e),
+            }
+
+
+# ---------------------------------------------------------------------------
+# Response extraction (resilient to dict / object shapes)
+# ---------------------------------------------------------------------------
+
+
+def _extract_text(resp: Any) -> str:
+    try:
+        choice = resp.choices[0]
+    except Exception:
+        return ""
+    msg = getattr(choice, "message", None) or (choice.get("message") if isinstance(choice, dict) else None)
+    if msg is None:
+        return ""
+    content = getattr(msg, "content", None)
+    if content is None and isinstance(msg, dict):
+        content = msg.get("content")
+    return content or ""
+
+
+def _extract_finish_reason(resp: Any) -> str:
+    try:
+        choice = resp.choices[0]
+    except Exception:
+        return "unknown"
+    reason = getattr(choice, "finish_reason", None)
+    if reason is None and isinstance(choice, dict):
+        reason = choice.get("finish_reason")
+    return reason or "unknown"
+
+
+def _extract_usage(resp: Any) -> dict | None:
+    usage = getattr(resp, "usage", None)
+    if usage is None and isinstance(resp, dict):
+        usage = resp.get("usage")
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return dict(usage)
+    # pydantic model -> dict
+    try:
+        return usage.model_dump()
+    except Exception:
+        return {
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+        }

@@ -1,0 +1,39 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+@theme {
+  --color-brand: #3d3d3d;
+  --color-brand-light: #555555;
+  --color-brand-bg: #f0f0f0;
+  --color-bg: #ffffff;
+  --color-bg2: #f5f5f5;
+  --color-bg3: #efefef;
+  --color-bg-hover: #e8e8e8;
+  --color-t1: #1a1a1a;
+  --color-t2: #666666;
+  --color-t3: #999999;
+  --color-line: #e2e2e2;
+  --color-line2: #d0d0d0;
+}
+
+body { font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 13px; }
+code, pre, .font-mono { font-family: 'IBM Plex Mono', 'SF Mono', 'Consolas', monospace; }
+
+/* Scrollbar: thin, no buttons, hugs right edge */
+* { scrollbar-width: thin; scrollbar-color: #d4d4d4 transparent; }
+::-webkit-scrollbar { width: 5px; background: transparent; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d4d4d4; border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: #b0b0b0; }
+::-webkit-scrollbar-button { display: none; height: 0; }
+
+.cite-tag { @apply inline-block px-1.5 py-0.5 rounded text-[10px] cursor-pointer bg-brand-bg text-brand font-medium transition-colors; }
+.cite-tag:hover { @apply bg-brand text-white; }
+
+.popover { @apply fixed z-20 bg-bg border border-line rounded-lg shadow-lg; }
+
+.toggle { @apply relative w-7 h-3.5 rounded-full cursor-pointer transition-colors; }
+.toggle-dot { @apply absolute top-0.5 w-2.5 h-2.5 rounded-full bg-white transition-transform; }
+
+@keyframes fadein { from{opacity:0;transform:translateY(3px)} to{opacity:1;transform:translateY(0)} }
+.fadein { animation: fadein 0.15s ease-out; }

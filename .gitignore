@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+.env
+
+# Node
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+/tests/pdfs/
+.pytest_cache/
+
+# Storage (runtime data)
+/storage/
+*.db
+*.db-wal
+*.db-shm
+
+# Runtime config (contains credentials — use examples/ as template)
+forgerag.yaml
+myconfig.yaml
+
+# Benchmark (large result files with LLM outputs)
+/benchmark_results/
+/benchmark_cache/
+
+# Logs
+*.log
+
+# Claude
+/.claude
+
+# Misc
+test_localsystem.txt
+*.pickle
+/cloc-2.08.exe

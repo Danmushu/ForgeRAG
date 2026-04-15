@@ -1,0 +1,214 @@
+"""
+LLM-as-judge scoring for benchmark items.
+
+Evaluates three RAGAS-style metrics via direct LiteLLM calls
+(no RAGAS / LangChain dependency):
+
+    1. Faithfulness  — answer grounded in retrieved context?
+    2. Relevancy     — answer addresses the question?
+    3. Context Precision — retrieved chunks relevant to the question?
+
+Each metric returns a float 0-1.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import threading
+from collections.abc import Callable
+
+from config.auth import resolve_api_key
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Prompt templates
+# ---------------------------------------------------------------------------
+
+_FAITHFULNESS_PROMPT = """\
+You are evaluating the faithfulness of an answer.
+
+Question: {question}
+
+Context (retrieved passages):
+{context}
+
+Answer: {answer}
+
+Does the answer ONLY use information present in the context above?
+Score from 0.0 to 1.0:
+- 1.0 = every claim in the answer is supported by the context
+- 0.5 = some claims are supported, some are not
+- 0.0 = the answer fabricates information not in the context
+
+Respond with ONLY a JSON object: {{"score": <float>, "reason": "<brief explanation>"}}
+"""
+
+_RELEVANCY_PROMPT = """\
+You are evaluating the relevancy of an answer.
+
+Question: {question}
+Answer: {answer}
+
+Does the answer actually address the question asked?
+Score from 0.0 to 1.0:
+- 1.0 = the answer directly and completely addresses the question
+- 0.5 = the answer partially addresses the question
+- 0.0 = the answer is irrelevant or off-topic
+
+Respond with ONLY a JSON object: {{"score": <float>, "reason": "<brief explanation>"}}
+"""
+
+_CONTEXT_PRECISION_PROMPT = """\
+You are evaluating context precision for a retrieval system.
+
+Question: {question}
+Ground truth answer: {ground_truth}
+
+Retrieved passages:
+{context}
+
+Are the retrieved passages relevant to answering the question?
+Score from 0.0 to 1.0:
+- 1.0 = all passages contain information needed to answer the question
+- 0.5 = some passages are relevant, some are noise
+- 0.0 = none of the passages are relevant
+
+Respond with ONLY a JSON object: {{"score": <float>, "reason": "<brief explanation>"}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+
+def score_items(
+    *,
+    items: list,
+    cfg,
+    cancel: threading.Event | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
+):
+    """Score each BenchmarkItem in-place with three metrics."""
+    gen_cfg = cfg.answering.generator
+    model = gen_cfg.model
+    api_key = resolve_api_key(
+        api_key=gen_cfg.api_key,
+        api_key_env=gen_cfg.api_key_env,
+        context="benchmark_scoring",
+    )
+    api_base = gen_cfg.api_base
+
+    import litellm
+
+    total = len(items)
+    for i, item in enumerate(items):
+        if cancel and cancel.is_set():
+            return
+        if item.error or not item.answer:
+            if progress_cb:
+                progress_cb(i + 1, total)
+            continue
+
+        context_str = "\n---\n".join(item.contexts[:10]) if item.contexts else "(no context retrieved)"
+
+        # Run three scoring prompts
+        try:
+            item.faithfulness = _call_judge(
+                litellm,
+                model,
+                api_key,
+                api_base,
+                _FAITHFULNESS_PROMPT.format(
+                    question=item.question,
+                    context=context_str[:5000],
+                    answer=item.answer[:2000],
+                ),
+            )
+        except Exception as e:
+            log.warning("faithfulness scoring failed for item %d: %s", i, e)
+            item.faithfulness = None
+
+        try:
+            item.relevancy = _call_judge(
+                litellm,
+                model,
+                api_key,
+                api_base,
+                _RELEVANCY_PROMPT.format(
+                    question=item.question,
+                    answer=item.answer[:2000],
+                ),
+            )
+        except Exception as e:
+            log.warning("relevancy scoring failed for item %d: %s", i, e)
+            item.relevancy = None
+
+        try:
+            item.context_precision = _call_judge(
+                litellm,
+                model,
+                api_key,
+                api_base,
+                _CONTEXT_PRECISION_PROMPT.format(
+                    question=item.question,
+                    ground_truth=item.ground_truth[:1000],
+                    context=context_str[:5000],
+                ),
+            )
+        except Exception as e:
+            log.warning("context_precision scoring failed for item %d: %s", i, e)
+            item.context_precision = None
+
+        if progress_cb:
+            progress_cb(i + 1, total)
+
+
+def _call_judge(
+    litellm,
+    model: str,
+    api_key: str | None,
+    api_base: str | None,
+    prompt: str,
+) -> float:
+    """Call LLM judge and extract score."""
+    kwargs = dict(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=200,
+        timeout=30.0,
+    )
+    if api_key:
+        kwargs["api_key"] = api_key
+    if api_base:
+        kwargs["api_base"] = api_base
+
+    resp = litellm.completion(**kwargs)
+    text = resp.choices[0].message.content or ""
+    return _extract_score(text)
+
+
+_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _extract_score(text: str) -> float:
+    m = _JSON_RE.search(text)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            score = float(data.get("score", 0))
+            return max(0.0, min(1.0, score))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+    # Fallback: try to find a bare number
+    nums = re.findall(r"(\d+\.?\d*)", text)
+    for n in nums:
+        v = float(n)
+        if 0 <= v <= 1:
+            return v
+    return 0.0

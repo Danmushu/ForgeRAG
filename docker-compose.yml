@@ -1,0 +1,59 @@
+version: "3.9"
+
+services:
+  forgerag:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - FORGERAG_CONFIG=/app/config.yaml
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-forgerag}
+    volumes:
+      - storage:/app/storage
+      - ./docker/config.yaml:/app/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: forgerag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-forgerag}
+      POSTGRES_DB: forgerag
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forgerag"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # Optional: Neo4j for knowledge graph (start with --profile neo4j)
+  neo4j:
+    image: neo4j:5
+    profiles: [neo4j]
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-forgerag}
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4jdata:/data
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  storage:
+  pgdata:
+  neo4jdata:

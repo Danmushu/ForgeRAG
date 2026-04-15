@@ -1,0 +1,534 @@
+"""
+/api/v1/documents — ingestion, listing, detail, delete, reparse
+/api/v1/documents/{doc_id}/blocks
+/api/v1/documents/{doc_id}/chunks
+/api/v1/documents/{doc_id}/tree
+"""
+
+from __future__ import annotations
+
+import logging
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+
+from ..deps import get_state
+from ..schemas import (
+    BlockOut,
+    ChunkOut,
+    DocumentOut,
+    IngestAcceptedResponse,
+    IngestRequest,
+    IngestResponse,
+    PaginatedResponse,
+    TreeNodeOut,
+    TreeOut,
+)
+from ..state import AppState
+
+log = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _doc_out(row: dict, state: AppState | None = None) -> DocumentOut:
+    out = DocumentOut(**{k: row[k] for k in DocumentOut.model_fields if k in row})
+    if state is not None:
+        pv = row.get("active_parse_version", 1)
+        doc_id = row["doc_id"]
+        try:
+            out.num_blocks = state.store.count_blocks(doc_id, pv)
+            out.num_chunks = state.store.count_chunks(doc_id, pv)
+        except Exception as e:
+            log.warning("failed to count blocks/chunks for %s: %s", doc_id, e)
+        file_id = row.get("file_id")
+        if file_id:
+            try:
+                f = state.store.get_file(file_id)
+                if f:
+                    out.file_name = f.get("original_name")
+                    out.file_size_bytes = f.get("size_bytes")
+            except Exception:
+                pass
+    return out
+
+
+def _block_out(row: dict) -> BlockOut:
+    return BlockOut(
+        block_id=row["block_id"],
+        doc_id=row["doc_id"],
+        parse_version=row["parse_version"],
+        page_no=row["page_no"],
+        seq=row["seq"],
+        bbox={"x0": row["bbox_x0"], "y0": row["bbox_y0"], "x1": row["bbox_x1"], "y1": row["bbox_y1"]},
+        type=row["type"],
+        level=row.get("level"),
+        text=row["text"],
+        confidence=row["confidence"],
+        table_html=row.get("table_html"),
+        table_markdown=row.get("table_markdown"),
+        figure_storage_key=row.get("figure_storage_key"),
+        figure_caption=row.get("figure_caption"),
+        formula_latex=row.get("formula_latex"),
+        excluded=row["excluded"],
+        excluded_reason=row.get("excluded_reason"),
+        caption_of=row.get("caption_of"),
+        cross_ref_targets=list(row.get("cross_ref_targets") or []),
+    )
+
+
+def _chunk_out(row: dict) -> ChunkOut:
+    return ChunkOut(**{k: row[k] for k in ChunkOut.model_fields if k in row})
+
+
+def _ingest_response(result) -> IngestResponse:
+    return IngestResponse(
+        file_id=result.file_id,
+        doc_id=result.doc_id,
+        parse_version=result.parse_version,
+        num_blocks=result.num_blocks,
+        num_chunks=result.num_chunks,
+        tree_quality=result.tree_quality,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ingest
+# ---------------------------------------------------------------------------
+
+
+@router.post("", response_model=IngestAcceptedResponse, status_code=202)
+def ingest_document(
+    req: IngestRequest,
+    state: AppState = Depends(get_state),
+):
+    from pathlib import Path as _Path
+
+    from ingestion.queue import IngestionJob
+
+    # Validate file exists
+    file_row = state.store.get_file(req.file_id)
+    if not file_row:
+        raise HTTPException(404, f"file {req.file_id} not found")
+
+    doc_id = req.doc_id or f"doc_{req.file_id[:12]}"
+    name = file_row.get("display_name", "upload.bin")
+    ext = _Path(name).suffix.lower().lstrip(".")
+    fmt = {
+        "pdf": "pdf",
+        "docx": "docx",
+        "doc": "docx",
+        "pptx": "pptx",
+        "ppt": "pptx",
+        "xlsx": "xlsx",
+        "xls": "xlsx",
+        "txt": "text",
+        "md": "text",
+        "html": "html",
+        "htm": "html",
+    }.get(ext, ext or "unknown")
+
+    # Create placeholder (if not force_reparse with existing doc)
+    if not req.force_reparse:
+        state.store.create_document_placeholder(
+            doc_id=doc_id,
+            file_id=req.file_id,
+            filename=name,
+            format=fmt,
+            status="pending",
+        )
+    else:
+        state.store.update_document_status(doc_id, status="pending")
+
+    job = IngestionJob(
+        file_id=req.file_id,
+        doc_id=doc_id,
+        parse_version=req.parse_version,
+        enrich_summary=req.enrich_summary,
+        force_reparse=req.force_reparse,
+    )
+    state.ingest_queue.submit(job)
+
+    return IngestAcceptedResponse(
+        file_id=req.file_id,
+        doc_id=doc_id,
+        status="pending",
+        message="queued for processing",
+    )
+
+
+@router.post("/upload-and-ingest", response_model=IngestAcceptedResponse, status_code=202)
+async def upload_and_ingest(
+    file: UploadFile = File(...),
+    original_name: str | None = Form(None),
+    mime_type: str | None = Form(None),
+    doc_id: str | None = Form(None),
+    state: AppState = Depends(get_state),
+):
+    """
+    Upload a file and queue it for background ingestion.
+    Returns 202 Accepted immediately — the document appears in the
+    list with status='pending' and transitions through
+    processing → parsing → parsed → ready (or error).
+    """
+    from pathlib import Path as _Path
+
+    from ingestion.queue import IngestionJob
+
+    name = original_name or file.filename or "upload.bin"
+    mime = mime_type or file.content_type
+    data = await file.read()
+
+    # Phase A: upload file (fast, synchronous)
+    try:
+        file_id = state.ingestion.upload(
+            data,
+            original_name=name,
+            mime_type=mime,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    # Derive doc_id
+    actual_doc_id = doc_id or f"doc_{file_id[:12]}"
+
+    # Detect format from extension
+    ext = _Path(name).suffix.lower().lstrip(".")
+    fmt = {
+        "pdf": "pdf",
+        "docx": "docx",
+        "doc": "docx",
+        "pptx": "pptx",
+        "ppt": "pptx",
+        "xlsx": "xlsx",
+        "xls": "xlsx",
+        "txt": "text",
+        "md": "text",
+        "html": "html",
+        "htm": "html",
+    }.get(ext, ext or "unknown")
+
+    # Create placeholder document row immediately (visible to frontend)
+    state.store.create_document_placeholder(
+        doc_id=actual_doc_id,
+        file_id=file_id,
+        filename=name,
+        format=fmt,
+        status="pending",
+    )
+
+    # Enqueue for background processing
+    job = IngestionJob(
+        file_id=file_id,
+        doc_id=actual_doc_id,
+    )
+    state.ingest_queue.submit(job)
+
+    return IngestAcceptedResponse(
+        file_id=file_id,
+        doc_id=actual_doc_id,
+        status="pending",
+        message="queued for processing",
+    )
+
+
+# ---------------------------------------------------------------------------
+# CRUD
+# ---------------------------------------------------------------------------
+
+
+@router.get("", response_model=PaginatedResponse)
+def list_documents(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    search: str | None = Query(None),
+    status: str | None = Query(None),
+    state: AppState = Depends(get_state),
+):
+    rows = state.store.list_documents(limit=limit, offset=offset, search=search, status=status)
+    total = state.store.count_documents(status=status, search=search)
+    return PaginatedResponse(
+        items=[_doc_out(r, state) for r in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/{doc_id}", response_model=DocumentOut)
+def get_document(doc_id: str, state: AppState = Depends(get_state)):
+    row = state.store.get_document(doc_id)
+    if not row:
+        raise HTTPException(404, "document not found")
+    return _doc_out(row, state)
+
+
+@router.delete("/{doc_id}", status_code=204)
+def delete_document(doc_id: str, state: AppState = Depends(get_state)):
+    row = state.store.get_document(doc_id)
+    if not row:
+        raise HTTPException(404, "document not found")
+    pv = row["active_parse_version"]
+    file_id = row.get("file_id")
+
+    # Clean vector store BEFORE relational delete (need chunk_ids)
+    try:
+        chunks = state.store.get_chunks(doc_id, pv)
+        chunk_ids = [c["chunk_id"] for c in chunks]
+        if chunk_ids:
+            state.vector.delete_chunks(chunk_ids)
+    except Exception:
+        log.warning("vector cleanup failed for %s", doc_id)
+
+    # Clean knowledge graph
+    if state.graph_store is not None:
+        try:
+            removed = state.graph_store.delete_by_doc(doc_id)
+            if removed:
+                log.info("KG cleanup: removed %d entities for %s", removed, doc_id)
+        except Exception:
+            log.warning("KG cleanup failed for %s", doc_id)
+
+    # Delete document (cascades to chunks, blocks, etc.)
+    state.store.delete_document(doc_id)
+    state.refresh_bm25()
+
+    # Delete associated file record if no other documents reference it
+    if file_id:
+        try:
+            all_docs = state.store.list_documents(limit=10000)
+            has_refs = any(d.get("file_id") == file_id for d in all_docs)
+            if not has_refs:
+                state.store.delete_file(file_id)
+        except Exception:
+            log.warning("file cleanup failed for %s", file_id)
+
+
+@router.post("/{doc_id}/reparse", response_model=IngestAcceptedResponse, status_code=202)
+def reparse_document(
+    doc_id: str,
+    enrich_summary: bool | None = Query(None),
+    state: AppState = Depends(get_state),
+):
+    from ingestion.queue import IngestionJob
+
+    row = state.store.get_document(doc_id)
+    if not row:
+        raise HTTPException(404, "document not found")
+    file_id = row.get("file_id")
+    if not file_id:
+        raise HTTPException(400, "document has no file_id, cannot reparse")
+
+    pv = row["active_parse_version"]
+
+    # ── Clean up old associated data ──
+    # 1. Vector store (need chunk_ids before relational delete)
+    try:
+        chunks = state.store.get_chunks(doc_id, pv)
+        chunk_ids = [c["chunk_id"] for c in chunks]
+        if chunk_ids:
+            state.vector.delete_chunks(chunk_ids)
+    except Exception:
+        log.warning("reparse: vector cleanup failed for %s", doc_id)
+
+    # 2. Knowledge Graph
+    try:
+        if state.graph_store is not None:
+            state.graph_store.delete_by_doc(doc_id)
+    except Exception:
+        log.warning("reparse: KG cleanup failed for %s", doc_id)
+
+    # 3. Relational data (blocks, chunks, tree) for current parse version
+    try:
+        state.store.delete_parse_version(doc_id, pv)
+    except Exception:
+        log.warning("reparse: relational cleanup failed for %s", doc_id)
+
+    # 4. Reset all status fields to clean state
+    state.store.update_document_status(
+        doc_id,
+        status="pending",
+        embed_status="pending",
+        embed_provider_id=None,
+        embed_model=None,
+        embed_at=None,
+        enrich_status="pending",
+        enrich_provider_id=None,
+        enrich_model=None,
+        enrich_summary_count=0,
+        enrich_image_count=0,
+        enrich_at=None,
+        enrich_started_at=None,
+        parse_started_at=None,
+        parse_completed_at=None,
+        structure_started_at=None,
+        structure_completed_at=None,
+        embed_started_at=None,
+        kg_status=None,
+        kg_entity_count=None,
+        kg_relation_count=None,
+        kg_started_at=None,
+        kg_completed_at=None,
+        kg_provider_id=None,
+        kg_model=None,
+    )
+
+    # 5. Refresh BM25 (old chunks removed)
+    state.refresh_bm25()
+
+    job = IngestionJob(
+        file_id=file_id,
+        doc_id=doc_id,
+        enrich_summary=enrich_summary,
+        force_reparse=True,
+    )
+    state.ingest_queue.submit(job)
+
+    return IngestAcceptedResponse(
+        file_id=file_id,
+        doc_id=doc_id,
+        status="pending",
+        message="queued for reparse",
+    )
+
+
+@router.post("/{doc_id}/stop", status_code=200)
+def stop_document(doc_id: str, state: AppState = Depends(get_state)):
+    row = state.store.get_document(doc_id)
+    if not row:
+        raise HTTPException(404, "document not found")
+    current = row.get("status")
+    if current in ("ready", "error"):
+        raise HTTPException(400, f"document is already {current}")
+    # Best-effort cancellation of any queued/running ingestion job
+    try:
+        if hasattr(state, "ingest_queue") and hasattr(state.ingest_queue, "cancel"):
+            state.ingest_queue.cancel(doc_id)
+    except Exception:
+        log.debug("ingest_queue.cancel not available or failed for %s", doc_id)
+    state.store.update_document_status(doc_id, status="error")
+    return {"doc_id": doc_id, "status": "error", "message": "stopped"}
+
+
+# ---------------------------------------------------------------------------
+# Blocks
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{doc_id}/blocks", response_model=PaginatedResponse)
+def list_blocks(
+    doc_id: str,
+    limit: int = Query(100, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    state: AppState = Depends(get_state),
+):
+    row = state.store.get_document(doc_id)
+    if not row:
+        raise HTTPException(404, "document not found")
+    pv = row["active_parse_version"]
+    blocks = state.store.get_blocks_paginated(doc_id, pv, limit=limit, offset=offset)
+    total = state.store.count_blocks(doc_id, pv)
+    return PaginatedResponse(
+        items=[_block_out(b) for b in blocks],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chunks
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{doc_id}/chunks", response_model=PaginatedResponse)
+def list_chunks(
+    doc_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    state: AppState = Depends(get_state),
+):
+    row = state.store.get_document(doc_id)
+    if not row:
+        raise HTTPException(404, "document not found")
+    pv = row["active_parse_version"]
+    chunks = state.store.get_chunks_paginated(doc_id, pv, limit=limit, offset=offset)
+    total = state.store.count_chunks(doc_id, pv)
+    return PaginatedResponse(
+        items=[_chunk_out(c) for c in chunks],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tree
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{doc_id}/tree", response_model=TreeOut)
+def get_tree(doc_id: str, state: AppState = Depends(get_state)):
+    row = state.store.get_document(doc_id)
+    if not row:
+        raise HTTPException(404, "document not found")
+    pv = row["active_parse_version"]
+    tree = state.store.load_tree(doc_id, pv)
+    if not tree:
+        raise HTTPException(404, "tree not found")
+    nodes_out = {}
+    for nid, n in tree.get("nodes", {}).items():
+        nodes_out[nid] = TreeNodeOut(
+            node_id=n.get("node_id", nid),
+            parent_id=n.get("parent_id"),
+            level=n.get("level", 0),
+            title=n.get("title", ""),
+            page_start=n.get("page_start", 0),
+            page_end=n.get("page_end", 0),
+            children=n.get("children", []),
+            block_ids=n.get("block_ids", []),
+            element_types=n.get("element_types", []),
+            table_count=n.get("table_count", 0),
+            figure_count=n.get("figure_count", 0),
+            summary=n.get("summary"),
+            key_entities=n.get("key_entities", []),
+        )
+    return TreeOut(
+        doc_id=tree.get("doc_id", doc_id),
+        parse_version=tree.get("parse_version", pv),
+        root_id=tree.get("root_id", ""),
+        quality_score=tree.get("quality_score", 0.0),
+        generation_method=tree.get("generation_method", ""),
+        nodes=nodes_out,
+    )
+
+
+@router.get("/{doc_id}/tree/{node_id}", response_model=TreeNodeOut)
+def get_tree_node(doc_id: str, node_id: str, state: AppState = Depends(get_state)):
+    row = state.store.get_document(doc_id)
+    if not row:
+        raise HTTPException(404, "document not found")
+    tree = state.store.load_tree(doc_id, row["active_parse_version"])
+    if not tree:
+        raise HTTPException(404, "tree not found")
+    n = tree.get("nodes", {}).get(node_id)
+    if not n:
+        raise HTTPException(404, "node not found")
+    return TreeNodeOut(
+        node_id=n.get("node_id", node_id),
+        parent_id=n.get("parent_id"),
+        level=n.get("level", 0),
+        title=n.get("title", ""),
+        page_start=n.get("page_start", 0),
+        page_end=n.get("page_end", 0),
+        children=n.get("children", []),
+        block_ids=n.get("block_ids", []),
+        element_types=n.get("element_types", []),
+        table_count=n.get("table_count", 0),
+        figure_count=n.get("figure_count", 0),
+        summary=n.get("summary"),
+        key_entities=n.get("key_entities", []),
+    )

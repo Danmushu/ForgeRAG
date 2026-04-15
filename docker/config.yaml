@@ -1,0 +1,46 @@
+# Docker Compose config for ForgeRAG
+# Postgres + pgvector + Neo4j
+
+persistence:
+  relational:
+    backend: postgres
+    postgres:
+      host: postgres
+      port: 5432
+      database: forgerag
+      user: forgerag
+      password_env: POSTGRES_PASSWORD
+  vector:
+    backend: pgvector
+    pgvector:
+      dimension: 1536
+      distance: cosine
+      index_type: hnsw
+
+storage:
+  mode: local
+  local:
+    root: /app/storage/blobs
+
+embedder:
+  backend: litellm
+  dimension: 1536
+  litellm:
+    model: openai/text-embedding-3-small
+    api_key_env: OPENAI_API_KEY
+
+# Graph store: defaults to networkx (in-memory, zero setup).
+# To use Neo4j, start with: docker compose --profile neo4j up
+# and uncomment the block below:
+# graph:
+#   backend: neo4j
+#   neo4j:
+#     uri: bolt://neo4j:7687
+#     user: neo4j
+#     password_env: NEO4J_PASSWORD
+
+answering:
+  generator:
+    backend: litellm
+    model: openai/gpt-4o-mini
+    api_key_env: OPENAI_API_KEY
