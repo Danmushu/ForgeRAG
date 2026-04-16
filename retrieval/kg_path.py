@@ -22,7 +22,7 @@ chunks that are fed into the 4-way RRF merge.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -95,19 +95,43 @@ class KGPath:
         community_ctx = KGContext()
         relation_ctx = KGContext()
 
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="kg_path") as pool:
+        # Explicit pool + finally so a stuck worker cannot block search() on
+        # the executor's shutdown (the `with` context manager's __exit__ does
+        # shutdown(wait=True), which would defeat the collective timeout).
+        pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kg_path")
+        try:
             f_local = pool.submit(self._local_retrieval, entity_names, local_ctx)
             f_global = pool.submit(self._global_retrieval, keywords or entity_names, global_ctx)
             f_community = pool.submit(self._community_retrieval, query_vec, community_ctx)
             f_relation = pool.submit(self._relation_retrieval, query_vec, relation_ctx)
 
-            local_chunks = _result_or_empty(f_local, "local")
-            global_chunks = _result_or_empty(f_global, "global")
-            community_chunks = _result_or_empty(f_community, "community")
-            relation_chunks = _result_or_empty(f_relation, "relation")
+            # Collective timeout: wait once for all four futures, with ONE
+            # shared budget. Previously each _result_or_empty had its own
+            # 30s, so the worst case was 4×30=120s — pathological for a
+            # "parallel" path.
+            wait(
+                [f_local, f_global, f_community, f_relation],
+                timeout=_WORKER_TIMEOUT_S,
+                return_when=ALL_COMPLETED,
+            )
+            # Snapshot each worker's scores AND its ctx together. If a
+            # worker is still running, its ctx is being mutated concurrently
+            # — we drop it to avoid iterating a list that's being appended
+            # to from another thread.
+            local_chunks, local_ctx = _collect(f_local, local_ctx, "local")
+            global_chunks, global_ctx = _collect(f_global, global_ctx, "global")
+            community_chunks, community_ctx = _collect(f_community, community_ctx, "community")
+            relation_chunks, relation_ctx = _collect(f_relation, relation_ctx, "relation")
+        finally:
+            # wait=False + cancel_futures so we don't block on stragglers.
+            # Still-running threads are orphaned; Neo4j's driver has its own
+            # socket timeout, so they eventually die and the pool's threads
+            # return naturally.
+            pool.shutdown(wait=False, cancel_futures=True)
 
-        # Merge the four private contexts into self.kg_context, deduped by
-        # _eid / _rid. Local wins on ties because it's merged first.
+        # Merge the four (possibly-emptied) private contexts into
+        # self.kg_context, deduped by _eid / _rid. Local wins on ties
+        # because it's merged first.
         self.kg_context = _merge_contexts([local_ctx, global_ctx, community_ctx, relation_ctx])
 
         # Step 6: Weighted merge of chunk scores
@@ -477,18 +501,23 @@ class KGPath:
 # ---------------------------------------------------------------------------
 
 
-def _result_or_empty(future, label: str) -> dict[str, float]:
-    """Collect a worker's result, logging and swallowing failures.
+def _collect(future, ctx: KGContext, label: str) -> tuple[dict[str, float], KGContext]:
+    """Atomically harvest a worker's chunk scores and its KGContext.
 
-    A single slow/flaky retrieval level must not take down the whole
-    query — we return an empty score map and let the other three paths
-    still contribute.
+    Expects ``future`` to already be done (the caller uses
+    :func:`concurrent.futures.wait` with a collective timeout). If it's
+    still running, the worker thread is still appending to ``ctx`` — we
+    must NOT return it, or the main thread would race the worker during
+    the merge. Returns an empty ctx in that case (and on exception).
     """
+    if not future.done():
+        log.warning("KG path: %s retrieval timed out — skipping", label)
+        return {}, KGContext()
     try:
-        return future.result(timeout=_WORKER_TIMEOUT_S)
+        return future.result(), ctx
     except Exception as e:
         log.warning("KG path: %s retrieval failed: %s", label, e)
-        return {}
+        return {}, KGContext()
 
 
 def _resolve_and_emit_relations(
@@ -533,14 +562,15 @@ def _merge_contexts(parts: list[KGContext]) -> KGContext:
     """Deduplicate-merge a list of KGContexts into one.
 
     Entities are deduped by ``_eid``, relations by ``_rid``. Community
-    summaries are deduped by ``(title, summary)`` to avoid repeating the
-    same community block. The order of ``parts`` determines precedence
-    on ties — earlier contexts win.
+    summaries are simply concatenated (not deduped) to preserve the
+    original pre-parallelization behavior; only the community worker
+    writes them, so cross-worker dedup wouldn't do anything anyway. The
+    order of ``parts`` determines precedence on ties — earlier contexts
+    win.
     """
     out = KGContext()
     seen_eids: set[str] = set()
     seen_rids: set[str] = set()
-    seen_comm: set[tuple[str, str]] = set()
 
     for part in parts:
         for e in part.entities:
@@ -557,11 +587,6 @@ def _merge_contexts(parts: list[KGContext]) -> KGContext:
             if rid:
                 seen_rids.add(rid)
             out.relations.append(r)
-        for c in part.community_summaries:
-            key = (c.get("title", ""), c.get("summary", ""))
-            if key in seen_comm:
-                continue
-            seen_comm.add(key)
-            out.community_summaries.append(c)
+        out.community_summaries.extend(part.community_summaries)
 
     return out
