@@ -522,73 +522,95 @@ class Neo4jGraphStore(GraphStore):
     def delete_by_doc(self, doc_id: str) -> int:
         # Remove doc_id from source lists and clean chunk_ids by prefix;
         # delete entity/relation if source_doc_ids becomes empty.
+        #
+        # Cypher captures the relation_id / entity_id as a scalar BEFORE
+        # the DELETE so we can RETURN the list of truly-deleted keys —
+        # then we punch them out of the local FAISS mirrors without
+        # rescanning all of Neo4j.
         cypher_rels = """
         MATCH ()-[r:RELATES_TO]-()
         WHERE $doc_id IN r.source_doc_ids
         SET r.source_doc_ids = [x IN r.source_doc_ids WHERE x <> $doc_id],
             r.source_chunk_ids = [x IN r.source_chunk_ids WHERE NOT x STARTS WITH $doc_prefix]
-        WITH r
+        WITH r, r.relation_id AS rid
         WHERE size(r.source_doc_ids) = 0
         DELETE r
-        RETURN count(r) AS deleted_rels
+        RETURN collect(rid) AS deleted_rids
         """
         cypher_nodes = """
         MATCH (e:KGEntity)
         WHERE $doc_id IN e.source_doc_ids
         SET e.source_doc_ids = [x IN e.source_doc_ids WHERE x <> $doc_id],
             e.source_chunk_ids = [x IN e.source_chunk_ids WHERE NOT x STARTS WITH $doc_prefix]
-        WITH e
+        WITH e, e.entity_id AS eid
         WHERE size(e.source_doc_ids) = 0
         DETACH DELETE e
-        RETURN count(e) AS deleted_nodes
+        RETURN collect(eid) AS deleted_eids
         """
         params = {"doc_id": doc_id, "doc_prefix": doc_id + ":"}
-        total = 0
+        deleted_rids: list[str] = []
+        deleted_eids: list[str] = []
         with self._driver.session(database=self._database) as s:
             res = s.run(cypher_rels, **params).single()
-            total += res["deleted_rels"] if res else 0
+            if res and res["deleted_rids"]:
+                deleted_rids = list(res["deleted_rids"])
             res = s.run(cypher_nodes, **params).single()
-            total += res["deleted_nodes"] if res else 0
-        return total
+            if res and res["deleted_eids"]:
+                deleted_eids = list(res["deleted_eids"])
+        # Sync local mirrors — idempotent if a key never had an embedding.
+        for rid in deleted_rids:
+            self._relation_idx.remove(rid)
+            self._rel_cache.pop(rid, None)
+        for eid in deleted_eids:
+            self._entity_idx.remove(eid)
+        return len(deleted_rids) + len(deleted_eids)
 
     def cleanup_orphans(self, valid_doc_ids: set[str]) -> dict:
         """Remove entities/relations whose source docs no longer exist."""
         valid = sorted(valid_doc_ids)
 
-        # Clean relations: remove dead doc refs + chunk refs, delete if empty
+        # Clean relations: remove dead doc refs + chunk refs, delete if empty.
+        # Capture deleted relation_ids so we can punch them out of the
+        # local FAISS mirror precisely.
         cypher_rels = """
         MATCH ()-[r:RELATES_TO]-()
         WHERE any(d IN r.source_doc_ids WHERE NOT d IN $valid)
         SET r.source_doc_ids = [x IN r.source_doc_ids WHERE x IN $valid],
             r.source_chunk_ids = [c IN r.source_chunk_ids
                 WHERE any(v IN $valid WHERE c STARTS WITH v + ':')]
-        WITH r
+        WITH r, r.relation_id AS rid
         WHERE size(r.source_doc_ids) = 0
         DELETE r
-        RETURN count(r) AS removed
+        RETURN collect(rid) AS deleted_rids
         """
-        # Clean entities
         cypher_nodes = """
         MATCH (e:KGEntity)
         WHERE any(d IN e.source_doc_ids WHERE NOT d IN $valid)
         SET e.source_doc_ids = [x IN e.source_doc_ids WHERE x IN $valid],
             e.source_chunk_ids = [c IN e.source_chunk_ids
                 WHERE any(v IN $valid WHERE c STARTS WITH v + ':')]
-        WITH e
+        WITH e, e.entity_id AS eid
         WHERE size(e.source_doc_ids) = 0
         DETACH DELETE e
-        RETURN count(e) AS removed
+        RETURN collect(eid) AS deleted_eids
         """
-        removed_rels = 0
-        removed_nodes = 0
+        deleted_rids: list[str] = []
+        deleted_eids: list[str] = []
         with self._driver.session(database=self._database) as s:
             res = s.run(cypher_rels, valid=valid).single()
-            removed_rels = res["removed"] if res else 0
+            if res and res["deleted_rids"]:
+                deleted_rids = list(res["deleted_rids"])
             res = s.run(cypher_nodes, valid=valid).single()
-            removed_nodes = res["removed"] if res else 0
+            if res and res["deleted_eids"]:
+                deleted_eids = list(res["deleted_eids"])
+        for rid in deleted_rids:
+            self._relation_idx.remove(rid)
+            self._rel_cache.pop(rid, None)
+        for eid in deleted_eids:
+            self._entity_idx.remove(eid)
         return {
-            "removed_entities": removed_nodes,
-            "removed_relations": removed_rels,
+            "removed_entities": len(deleted_eids),
+            "removed_relations": len(deleted_rids),
         }
 
     # -- introspection ------------------------------------------------------

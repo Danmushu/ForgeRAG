@@ -259,6 +259,77 @@ class TestEntityIndexSyncOnUpsert:
         assert hits[0][0].name == "honey"
 
 
+class TestDeleteSyncsEntityIndex:
+    """After delete_by_doc removes an entity, it must not appear in
+    search_entities_by_embedding — otherwise top-k gets polluted by
+    silently-dropped ghosts.
+    """
+
+    def test_delete_removes_entity_from_embedding_index(self, tmp_path: Path):
+        emb = FakeMultilingualEmbedder()
+        g = NetworkXGraphStore(path=str(tmp_path / "kg.json"))
+
+        # Two entities; "bee" sourced only from doc1, "car" from doc2.
+        bee = Entity(
+            name="bee",
+            description="flying insect",
+            source_doc_ids={"doc1"},
+            source_chunk_ids={"doc1:c1"},
+        )
+        bee.name_embedding = emb.embed_texts(["bee"])[0]
+        car = Entity(
+            name="car",
+            description="motor vehicle",
+            source_doc_ids={"doc2"},
+            source_chunk_ids={"doc2:c1"},
+        )
+        car.name_embedding = emb.embed_texts(["car"])[0]
+        g.upsert_entity(bee)
+        g.upsert_entity(car)
+
+        # Before delete: "蜜蜂" finds "bee"
+        q_zh_bee = emb.embed_texts(["蜜蜂"])[0]
+        before = g.search_entities_by_embedding(q_zh_bee, top_k=3)
+        assert any(e.name == "bee" for e, _ in before)
+
+        # Delete doc1 — "bee" should be fully removed (no other doc refs it).
+        removed = g.delete_by_doc("doc1")
+        assert removed >= 1
+
+        # After delete: "蜜蜂" must not return "bee" — it's gone from the graph.
+        after = g.search_entities_by_embedding(q_zh_bee, top_k=3)
+        assert not any(e.name == "bee" for e, _ in after), (
+            "deleted entity still surfacing via embedding search — FAISS index not cleaned"
+        )
+        # And direct lookup also confirms it's gone.
+        assert g.get_entity(bee.entity_id) is None
+
+    def test_delete_keeps_shared_entity(self, tmp_path: Path):
+        """Deleting one of multiple sources must NOT remove the entity nor
+        invalidate its embedding entry — it stays searchable.
+        """
+        emb = FakeMultilingualEmbedder()
+        g = NetworkXGraphStore(path=str(tmp_path / "kg.json"))
+
+        # "bee" sourced from doc1 AND doc2
+        bee = Entity(
+            name="bee",
+            description="flying insect",
+            source_doc_ids={"doc1", "doc2"},
+            source_chunk_ids={"doc1:c1", "doc2:c1"},
+        )
+        bee.name_embedding = emb.embed_texts(["bee"])[0]
+        g.upsert_entity(bee)
+
+        # Delete doc1: bee.source_doc_ids becomes {doc2} — entity stays.
+        g.delete_by_doc("doc1")
+
+        # Embedding search still finds it.
+        q_zh_bee = emb.embed_texts(["蜜蜂"])[0]
+        hits = g.search_entities_by_embedding(q_zh_bee, top_k=3)
+        assert any(e.name == "bee" for e, _ in hits)
+
+
 class TestBackwardCompat:
     """Entities without name_embedding should still be reachable by SHA256 name lookup."""
 

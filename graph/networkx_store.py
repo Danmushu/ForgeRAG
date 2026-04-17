@@ -623,8 +623,14 @@ class NetworkXGraphStore(GraphStore):
                 self._graph.remove_node(nid)
 
             if deleted:
-                # Rebuild FAISS indexes to remove stale entries
+                # Rebuild FAISS indexes to remove stale entries. The
+                # entity index matters for cross-lingual search: without
+                # this rebuild, search_entities_by_embedding could
+                # return FAISS hits whose underlying entity no longer
+                # exists in the graph (silently dropped by the caller,
+                # but wastes top-k slots).
                 self._rebuild_relation_index()
+                self._rebuild_entity_index()
                 self._save()
             return deleted
 
@@ -678,6 +684,7 @@ class NetworkXGraphStore(GraphStore):
 
             if removed_edges or removed_nodes:
                 self._rebuild_relation_index()
+                self._rebuild_entity_index()
                 self._save()
 
             return {
