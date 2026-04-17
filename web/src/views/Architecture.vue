@@ -270,9 +270,8 @@ const PARENT_CHILD = [
   { parent: '_backend_mismatch:storage.mode:s3', prefix: 'storage.s3.' },
   { parent: '_backend_mismatch:storage.mode:oss', prefix: 'storage.oss.' },
   // Persistence: show sub-config only for selected backend
-  { parent: '_backend_mismatch:persistence.relational.backend:sqlite', prefix: 'persistence.relational.sqlite.' },
+  // (ForgeRAG production is PostgreSQL-only; legacy sqlite/mysql entries removed.)
   { parent: '_backend_mismatch:persistence.relational.backend:postgres', prefix: 'persistence.relational.postgres.' },
-  { parent: '_backend_mismatch:persistence.relational.backend:mysql', prefix: 'persistence.relational.mysql.' },
   { parent: '_backend_mismatch:persistence.vector.backend:chromadb', prefix: 'persistence.vector.chromadb.' },
   { parent: '_backend_mismatch:persistence.vector.backend:qdrant', prefix: 'persistence.vector.qdrant.' },
   { parent: '_backend_mismatch:persistence.vector.backend:milvus', prefix: 'persistence.vector.milvus.' },

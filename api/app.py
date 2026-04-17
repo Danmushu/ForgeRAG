@@ -55,6 +55,7 @@ from .routes import chunks as chunk_routes
 from .routes import conversations as conversation_routes
 from .routes import documents as document_routes
 from .routes import files as file_routes
+from .routes import folders as folder_routes
 from .routes import graph as graph_routes
 from .routes import health as health_routes
 from .routes import llm_providers as llm_provider_routes
@@ -62,6 +63,7 @@ from .routes import query as query_routes
 from .routes import settings as settings_routes
 from .routes import system as system_routes
 from .routes import traces as trace_routes
+from .routes import trash as trash_routes
 from .state import AppState
 
 log = logging.getLogger(__name__)
@@ -73,6 +75,9 @@ def _run_startup_probes(state: "AppState") -> None:
     recorded in the health registry; failures are logged but don't
     abort server startup — users should still be able to fix config
     via the UI even if one provider is down.
+
+    Also runs trash auto-purge once on startup so items older than the
+    retention window are cleaned without requiring a cron task.
     """
     try:
         from retrieval.rerank import make_reranker
@@ -87,6 +92,15 @@ def _run_startup_probes(state: "AppState") -> None:
                 log.warning("reranker probe FAILED: %s", e)
     except Exception as e:
         log.warning("skipping reranker probe — cannot construct reranker: %s", e)
+
+    # Startup trash auto-purge. Retention read from config or defaults to 30.
+    try:
+        from persistence.trash_service import TrashService
+
+        retention = int(getattr(getattr(state.cfg, "trash", object()), "retention_days", 30))
+        TrashService(state).auto_purge(retention_days=retention)
+    except Exception as e:
+        log.warning("trash auto-purge on startup failed: %s", e)
 
 
 def create_app(
@@ -179,6 +193,8 @@ def create_app(
     app.include_router(llm_provider_routes.router)
     app.include_router(graph_routes.router)
     app.include_router(benchmark_routes.router)
+    app.include_router(folder_routes.router)
+    app.include_router(trash_routes.router)
 
     # ------------------------------------------------------------------
     # Serve frontend static files if web/ directory exists.

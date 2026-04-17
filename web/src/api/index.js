@@ -121,3 +121,16 @@ export {
   startBenchmark, cancelBenchmark, getBenchmarkStatus,
   listBenchmarkReports, downloadBenchmarkReport,
 } from './benchmark'
+
+// Folders + document path
+export {
+  listFolders, getFolderTree, getFolderInfo,
+  createFolder, renameFolder, moveFolder, deleteFolder,
+  moveDocument, bulkMoveDocuments,
+} from './folders'
+
+// Trash
+export {
+  listTrash, getTrashStats,
+  restoreFromTrash, purgeTrashItems, emptyTrash,
+} from './trash'
