@@ -95,7 +95,7 @@ class MergeConfig(BaseModel):
 class RerankConfig(BaseModel):
     provider_id: str | None = None  # resolved at startup from llm_providers table
     enabled: bool = False
-    backend: Literal["passthrough", "litellm"] = "passthrough"
+    backend: Literal["passthrough", "rerank_api", "llm_as_reranker"] = "passthrough"
     model: str = "openai/gpt-4o-mini"
     top_k: int = 10
     api_key: str | None = None

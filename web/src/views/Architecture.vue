@@ -284,8 +284,8 @@ const VALIDATION_RULES = [
   { node: 'kg_extraction', condition: () => isOn('kg_extraction'), key: 'retrieval.kg_extraction.provider_id', message: 'Extraction LLM is required when enabled' },
   // KG Path: when enabled, needs LLM
   { node: 'kg', condition: () => isOn('kg'), key: 'retrieval.kg_path.provider_id', message: 'KG query LLM is required when enabled' },
-  // Rerank: when enabled + litellm backend, needs provider
-  { node: 'rerank', condition: () => isOn('rerank') && gv('retrieval.rerank.backend') === 'litellm', key: 'retrieval.rerank.provider_id', message: 'Rerank model is required when using litellm backend' },
+  // Rerank: when enabled with a non-passthrough backend, needs provider
+  { node: 'rerank', condition: () => isOn('rerank') && gv('retrieval.rerank.backend') !== 'passthrough', key: 'retrieval.rerank.provider_id', message: 'Rerank model is required when using a non-passthrough backend' },
   // VLM: when enabled, needs provider (shown under parser)
   { node: 'parser', condition: () => gv('image_enrichment.enabled'), key: 'image_enrichment.provider_id', message: 'VLM model is required when image enrichment is on' },
 ]
