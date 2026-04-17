@@ -128,6 +128,31 @@ class KGPath:
         # _eid / _rid. Local wins on ties because it's merged first.
         self.kg_context = _merge_contexts([local_ctx, global_ctx, relation_ctx])
 
+        # Cap the synthesized context to prevent hub-entity 2-hop
+        # explosion (seen on legal corpora: a "Company" query entity
+        # can pull thousands of neighbor entities + relations, none
+        # actually relevant). Caps chosen to match roughly what the
+        # generator prompt can fit inside its 40% kg-budget (~50 lines
+        # each at ~60 chars/line). Later entries are dropped — local
+        # retrieval is merged first, so the kept entries are the most
+        # directly relevant to the query's extracted entities.
+        _MAX_KG_ENTITIES = 50
+        _MAX_KG_RELATIONS = 30
+        if len(self.kg_context.entities) > _MAX_KG_ENTITIES:
+            log.debug(
+                "KG context: truncating entities %d -> %d",
+                len(self.kg_context.entities),
+                _MAX_KG_ENTITIES,
+            )
+            self.kg_context.entities = self.kg_context.entities[:_MAX_KG_ENTITIES]
+        if len(self.kg_context.relations) > _MAX_KG_RELATIONS:
+            log.debug(
+                "KG context: truncating relations %d -> %d",
+                len(self.kg_context.relations),
+                _MAX_KG_RELATIONS,
+            )
+            self.kg_context.relations = self.kg_context.relations[:_MAX_KG_RELATIONS]
+
         # Step 5: Weighted merge of chunk scores
         merged = self._merge_scores(
             local_chunks,
