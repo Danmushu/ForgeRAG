@@ -163,6 +163,12 @@ class LLMTreeNavigator:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             timeout=self.timeout,
+            # Disable litellm's internal retries so total wall-clock time
+            # stays bounded by self.timeout. Without this, litellm may
+            # silently retry N times, each up to self.timeout — making the
+            # actual wait N*timeout, which easily exceeds the outer
+            # tree_path worker timeout and creates the "49s outlier" effect.
+            num_retries=0,
         )
         if self._api_key:
             kwargs["api_key"] = self._api_key
