@@ -35,6 +35,7 @@ function _stopTimer() { if (_timer) { clearInterval(_timer); _timer = null } }
 
 <script setup>
 import { ref, reactive, nextTick, computed, inject, watch, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { askQueryStream, createConversation, addMessage, getMessages, filePreviewUrl, fileDownloadUrl, getTrace } from '@/api'
 import { renderMarkdown } from '@/utils/renderMarkdown'
 import PdfViewer from '@/components/PdfViewer.vue'
@@ -42,6 +43,19 @@ import Spinner from '@/components/Spinner.vue'
 
 const convId = inject('convId')
 const loadConvs = inject('loadConvs')
+
+// Path scoping: read `path_filter` from URL (e.g. ?path_filter=/legal).
+// User can clear the chip via the Chat UI.
+const route = useRoute()
+const router = useRouter()
+const pathFilter = ref(route.query.path_filter || '')
+watch(() => route.query.path_filter, v => { pathFilter.value = v || '' })
+function clearPathFilter() {
+  pathFilter.value = ''
+  const q = { ...route.query }
+  delete q.path_filter
+  router.replace({ query: q })
+}
 
 // Bind module-level refs to local names for template access
 const msgs = _msgs
@@ -345,7 +359,7 @@ async function send(text) {
   abortCtrl.value = new AbortController()
   try {
     let fin = null
-    for await (const { event, data } of askQueryStream({ query: q, conversationId: convId.value, signal: abortCtrl.value.signal })) {
+    for await (const { event, data } of askQueryStream({ query: q, conversationId: convId.value, pathFilter: pathFilter.value || null, signal: abortCtrl.value.signal })) {
       // If conversation switched away, stop updating UI but don't abort request
       if (myGenId !== _streamGenId) break
       if (event === 'progress') {
@@ -584,7 +598,18 @@ function buildPhaseGroups(phases) {
 </script>
 
 <template>
-  <div class="flex h-full">
+  <div class="flex h-full relative">
+    <!-- Path-filter chip: visible only when @path scoping is active -->
+    <div
+      v-if="pathFilter"
+      class="absolute top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 px-3 py-1.5 rounded-full bg-brand/10 border border-brand/30 text-[11px] text-brand select-none"
+      :title="'Chat scoped to: ' + pathFilter"
+    >
+      <span>📁 Scope:</span>
+      <span class="font-mono truncate max-w-[320px]">{{ pathFilter }}</span>
+      <button class="text-brand/80 hover:text-brand ml-1" @click="clearPathFilter" title="Clear scope">✕</button>
+    </div>
+
     <!-- ═══════ Trace panel ═══════ -->
     <Transition name="slide-trace">
       <div v-if="trace.show" class="w-72 shrink-0 border-r border-line flex flex-col bg-bg overflow-hidden">

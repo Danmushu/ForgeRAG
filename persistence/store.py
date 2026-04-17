@@ -85,6 +85,61 @@ class Store:
         assert self._engine is not None
         Base.metadata.create_all(self._engine)
         self._migrate_add_columns()
+        self._seed_system_folders()
+
+    def _seed_system_folders(self) -> None:
+        """
+        Ensure the two system folders (__root__, __trash__) exist.
+        Both the alembic migration and the test-mode Base.metadata.create_all()
+        rely on this — the migration runs this SQL explicitly, but tests use
+        create_all() which doesn't execute data seeds.
+        """
+        from sqlalchemy import text
+
+        assert self._engine is not None
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO folders (folder_id, path, path_lower, parent_id,
+                                         name, is_system, metadata_json)
+                    SELECT '__root__', '/', '/', NULL, 'Root', :tt, '{}'
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM folders WHERE folder_id = '__root__'
+                    )
+                    """
+                ),
+                {"tt": True},
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO folders (folder_id, path, path_lower, parent_id,
+                                         name, is_system, metadata_json)
+                    SELECT '__trash__', '/__trash__', '/__trash__', '__root__',
+                           'Trash', :tt, '{}'
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM folders WHERE folder_id = '__trash__'
+                    )
+                    """
+                ),
+                {"tt": True},
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO folder_grants (grant_id, folder_id, principal_id,
+                                               principal_type, permission,
+                                               inherit, granted_by)
+                    SELECT '__bootstrap__', '__root__', 'local', 'user',
+                           'admin', :inh, 'system'
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM folder_grants WHERE grant_id = '__bootstrap__'
+                    )
+                    """
+                ),
+                {"inh": True},
+            )
 
     # Column renames: (table_name, old_col, new_col)
     _COLUMN_RENAMES: list[tuple[str, str, str]] = [

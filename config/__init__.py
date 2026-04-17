@@ -39,7 +39,6 @@ from .parser import (
 from .persistence import (
     ChromaConfig,
     MilvusConfig,
-    MySQLConfig,
     PersistenceConfig,
     PgvectorConfig,
     PostgresConfig,
@@ -89,7 +88,6 @@ __all__ = [
     "MergeConfig",
     "MilvusConfig",
     "MinerUConfig",
-    "MySQLConfig",
     "Neo4jConfig",
     "NetworkXConfig",
     "NormalizeConfig",
