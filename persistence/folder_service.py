@@ -31,7 +31,7 @@ from typing import Iterable
 from sqlalchemy import and_, select, update
 from sqlalchemy.orm import Session
 
-from .models import AuditLogRow, Document, Folder
+from .models import AuditLogRow, Document, Folder, PendingFolderOp
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +49,13 @@ _NAME_FORBIDDEN = re.compile(r'[\\/?*<>|":\x00-\x1f]')
 _MAX_NAME_LEN = 255
 _MAX_PATH_LEN = 1024
 _MAX_DEPTH = 10   # path.count('/') cannot exceed this
+
+# Threshold (number of affected chunks) above which cross-store rename
+# (Chroma metadata / Neo4j source_paths) is deferred to nightly maintenance
+# rather than run synchronously after the PG transaction commits. Empirically
+# 2000 chunks ≈ a few seconds on SSD, which is acceptable user-facing latency;
+# anything larger risks a perceptible stall on folder rename.
+_CROSS_STORE_SYNC_THRESHOLD = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +174,12 @@ class FolderService:
     def __init__(self, sess: Session, *, actor_id: str = "local"):
         self.sess = sess
         self.actor_id = actor_id
+        # Collected by _cascade_path_rewrite for sync-path renames. The
+        # caller drains this list AFTER commit via ``apply_cross_store``
+        # so Chroma / Neo4j only see the change once PG is durable.
+        # Each entry: {"old_prefix": str, "new_prefix": str,
+        #              "affected_chunks": int}.
+        self.pending_sync_ops: list[dict] = []
 
     # ── Read ───────────────────────────────────────────────────────
 
@@ -423,14 +436,29 @@ class FolderService:
         a single transaction-scoped bulk UPDATE — for 100k chunks this
         completes in ~5 seconds on Postgres.
 
-        Chroma and Neo4j denormalized metadata is NOT touched here.
-        Callers that cross the async threshold enqueue a
-        ``pending_folder_ops`` row so the nightly maintenance script
-        catches those stores up.
+        Cross-store (Chroma metadata + Neo4j ``source_paths``) is
+        routed by affected-chunk count:
+
+          * < ``_CROSS_STORE_SYNC_THRESHOLD`` — recorded on
+            ``self.pending_sync_ops`` for the caller to apply synchronously
+            AFTER commit (so downstream stores only see the change once
+            PG is durable).
+          * ≥ threshold — enqueued as a ``PendingFolderOp`` row for the
+            nightly maintenance script to process asynchronously; OR
+            fallback filters on Chroma / Neo4j keep retrieval correct
+            while the queue drains.
         """
-        from sqlalchemy import func
+        from sqlalchemy import func, select as _select
 
         from .models import ChunkRow
+
+        # ── Pre-count: decide sync vs deferred before any write ──
+        affected_chunks = self.sess.execute(
+            _select(func.count()).select_from(ChunkRow).where(
+                (ChunkRow.path == old_prefix)
+                | (ChunkRow.path.like(old_prefix.rstrip("/") + "/%"))
+            )
+        ).scalar_one() or 0
 
         # folders.path + path_lower
         folders_stmt = (
@@ -486,6 +514,71 @@ class FolderService:
             .execution_options(synchronize_session=False)
         )
         self.sess.execute(chunks_stmt)
+
+        # ── Threshold router: small ops go sync, big ops go deferred ──
+        if int(affected_chunks) < _CROSS_STORE_SYNC_THRESHOLD:
+            self.pending_sync_ops.append(
+                {
+                    "old_prefix": old_prefix,
+                    "new_prefix": new_prefix,
+                    "affected_chunks": int(affected_chunks),
+                }
+            )
+        else:
+            self.sess.add(
+                PendingFolderOp(
+                    op_type="path_rewrite",
+                    old_prefix=old_prefix,
+                    new_prefix=new_prefix,
+                    affected_chunks=int(affected_chunks),
+                    status="pending",
+                )
+            )
+
+    # ── Cross-store sync (called by the caller AFTER PG commit) ────
+
+    def apply_cross_store(
+        self,
+        *,
+        graph_store=None,
+        vector_store=None,
+    ) -> list[dict]:
+        """Apply the sync-path renames collected during this service
+        session to Chroma + Neo4j. Only call AFTER the Session has
+        committed — otherwise downstream stores would carry a rewrite
+        that PG might still roll back.
+
+        Returns the list of executed ops with per-store touch counts.
+        Errors are logged but not raised — each store tracks its own
+        progress via ``pending_folder_ops`` semantics and the nightly
+        reconciler will eventually catch up any partial failure.
+        """
+        import logging
+
+        log = logging.getLogger(__name__)
+
+        executed: list[dict] = []
+        for op in list(self.pending_sync_ops):
+            op_result = dict(op)
+            try:
+                if graph_store is not None and hasattr(graph_store, "update_paths"):
+                    op_result["graph_touched"] = int(
+                        graph_store.update_paths(op["old_prefix"], op["new_prefix"])
+                    )
+            except Exception as e:
+                log.warning("sync update_paths on graph failed for %s: %s", op, e)
+                op_result["graph_error"] = str(e)
+            try:
+                if vector_store is not None and hasattr(vector_store, "update_paths"):
+                    op_result["vector_touched"] = int(
+                        vector_store.update_paths(op["old_prefix"], op["new_prefix"])
+                    )
+            except Exception as e:
+                log.warning("sync update_paths on vector failed for %s: %s", op, e)
+                op_result["vector_error"] = str(e)
+            executed.append(op_result)
+        self.pending_sync_ops.clear()
+        return executed
 
     def _audit(
         self,

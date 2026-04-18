@@ -332,8 +332,18 @@ class IngestionPipeline:
                         api_base=kg_cfg.api_base,
                         timeout=kg_cfg.timeout,
                     )
-                    # Build chunk dicts for batch extraction
-                    chunk_dicts = [{"chunk_id": c.chunk_id, "content": c.content} for c in chunks]
+                    # Build chunk dicts for batch extraction. Threading
+                    # the owning document's path into each chunk dict
+                    # lets the extractor denormalize path onto the
+                    # resulting Entity/Relation.source_paths — this is
+                    # what KG path-prefix pre-filtering reads at query
+                    # time (see graph/neo4j_store.py::search_*_by_path).
+                    doc_row = self.rel.get_document(doc_id) or {}
+                    doc_path = doc_row.get("path") or "/"
+                    chunk_dicts = [
+                        {"chunk_id": c.chunk_id, "content": c.content, "path": doc_path}
+                        for c in chunks
+                    ]
                     entities, relations = extractor.extract_batch(
                         chunk_dicts,
                         doc_id,

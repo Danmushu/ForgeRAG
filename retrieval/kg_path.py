@@ -62,6 +62,7 @@ class KGPath:
         query: str,
         *,
         allowed_doc_ids: set[str] | None = None,
+        path_prefix: str | None = None,
     ) -> list[ScoredChunk]:
         """
         Multi-level KG retrieval.
@@ -82,6 +83,10 @@ class KGPath:
         the full KG, but the final output is scope-clean.
         """
         self.kg_context = KGContext()
+        # Stash for the duration of this call so worker methods and
+        # entity-resolution helpers can apply the same path scope
+        # without plumbing a new argument through every hop.
+        self._path_prefix = path_prefix
 
         # Step 1: Extract entities and keywords from query
         entity_names, keywords = self._extract_query_entities(query)
@@ -412,7 +417,11 @@ class KGPath:
             return {}
 
         top_k = getattr(self.cfg, "relation_top_k", 10)
-        matches = self.graph.search_relations_by_embedding(query_vec, top_k=top_k)
+        matches = self.graph.search_relations_by_embedding(
+            query_vec,
+            top_k=top_k,
+            path_prefix=getattr(self, "_path_prefix", None),
+        )
         if not matches:
             return {}
 
@@ -464,8 +473,13 @@ class KGPath:
         unresolved_idx: list[int] = []
         unresolved_names: list[str] = []
 
+        pfx = getattr(self, "_path_prefix", None)
         for i, name in enumerate(entity_names):
             entity = self.graph.get_entity(entity_id_from_name(name))
+            # Exact-hash hits bypass the vector index — apply the same
+            # path scope manually so scope leakage is impossible.
+            if entity is not None and pfx and not _entity_matches_prefix(entity, pfx):
+                entity = None
             if entity is not None:
                 resolved.append(entity)
             else:
@@ -496,15 +510,21 @@ class KGPath:
 
         Returns up to ``top_k`` Entity objects, ordered by relevance.
         """
+        pfx = getattr(self, "_path_prefix", None)
         if vec:
-            hits = self.graph.search_entities_by_embedding(vec, top_k=top_k)
+            hits = self.graph.search_entities_by_embedding(vec, top_k=top_k, path_prefix=pfx)
             # Filter below threshold: prevents a cold graph from returning
             # random near-orthogonal nearest neighbors.
             good = [e for e, score in hits if score >= self._EMBED_SEARCH_THRESHOLD]
             if good:
                 return good
-        # Fallback: fuzzy name (substring / fulltext).
-        return self.graph.search_entities(name, top_k=top_k)
+        # Fallback: fuzzy name (substring / fulltext). Apply path scope
+        # client-side here since the fulltext index doesn't know about
+        # source_paths — keep the scope contract consistent across hits.
+        results = self.graph.search_entities(name, top_k=top_k * 5 if pfx else top_k)
+        if pfx:
+            results = [e for e in results if _entity_matches_prefix(e, pfx)][:top_k]
+        return results
 
     def _batch_embed(self, texts: list[str]) -> list[list[float] | None]:
         """Embed a list of short texts in one API call.
@@ -597,6 +617,20 @@ class KGPath:
 # ---------------------------------------------------------------------------
 # Module-level helpers (stateless — safe to call from worker threads).
 # ---------------------------------------------------------------------------
+
+
+def _entity_matches_prefix(entity, prefix: str) -> bool:
+    """True if any ``entity.source_paths`` entry is under ``prefix``.
+
+    Segment-boundary match: ``/legal`` matches ``/legal`` and
+    ``/legal/foo`` but NOT ``/legal-extra``.
+    """
+    paths = getattr(entity, "source_paths", None)
+    if not paths:
+        return False
+    pfx = prefix.rstrip("/") or "/"
+    sep = pfx + "/"
+    return any(p == pfx or p.startswith(sep) for p in paths)
 
 
 def _collect(future, ctx: KGContext, label: str) -> tuple[dict[str, float], KGContext]:

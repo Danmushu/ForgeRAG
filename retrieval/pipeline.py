@@ -529,7 +529,11 @@ class RetrievalPipeline:
             from .kg_path import KGPath
 
             kp = KGPath(self.cfg.kg_path, self.graph_store, self.rel, embedder=self.embedder)
-            result = kp.search(query, allowed_doc_ids=allowed_doc_ids)
+            result = kp.search(
+                query,
+                allowed_doc_ids=allowed_doc_ids,
+                path_prefix=path_prefix,
+            )
             _kg_context[0] = kp.kg_context  # capture synthesized KG context
             _timings["kg"] = {
                 "start": t0k,

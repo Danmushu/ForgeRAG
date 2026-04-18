@@ -190,9 +190,36 @@ def create_folder(body: CreateFolderReq, state: AppState = Depends(get_state)):
         return _folder_to_out(svc, new)
 
 
+def _apply_post_commit_cross_store(
+    pending_ops: list[dict],
+    state: "AppState",
+) -> None:
+    """Run the sync-path update_paths on Chroma + Neo4j after the PG
+    transaction commits. The FolderService already queued these ops
+    below the ``_CROSS_STORE_SYNC_THRESHOLD``; this function is a
+    thin adapter that matches the service's expected kwargs.
+    """
+    if not pending_ops:
+        return
+    import logging
+    log = logging.getLogger(__name__)
+    for op in pending_ops:
+        try:
+            if state.graph_store is not None and hasattr(state.graph_store, "update_paths"):
+                state.graph_store.update_paths(op["old_prefix"], op["new_prefix"])
+        except Exception as e:
+            log.warning("graph update_paths sync failed for %s: %s", op, e)
+        try:
+            if state.vector_store is not None and hasattr(state.vector_store, "update_paths"):
+                state.vector_store.update_paths(op["old_prefix"], op["new_prefix"])
+        except Exception as e:
+            log.warning("vector update_paths sync failed for %s: %s", op, e)
+
+
 @router.patch("/rename", response_model=FolderOut)
 def rename_folder(body: RenameFolderReq, state: AppState = Depends(get_state)):
     perm = PermissionService(state.store)
+    pending_ops: list[dict] = []
     with state.store.transaction() as sess:
         svc = FolderService(sess)
         try:
@@ -208,12 +235,19 @@ def rename_folder(body: RenameFolderReq, state: AppState = Depends(get_state)):
             raise HTTPException(409, str(e))
         except FolderIsSystemProtected as e:
             raise HTTPException(403, str(e))
-        return _folder_to_out(svc, updated)
+        out = _folder_to_out(svc, updated)
+        # Capture pending cross-store ops BEFORE the session commits so we
+        # can apply them AFTER — applying pre-commit would make Chroma /
+        # Neo4j observe a rename that PG could still roll back.
+        pending_ops = list(svc.pending_sync_ops)
+    _apply_post_commit_cross_store(pending_ops, state)
+    return out
 
 
 @router.post("/move", response_model=FolderOut)
 def move_folder(body: MoveFolderReq, state: AppState = Depends(get_state)):
     perm = PermissionService(state.store)
+    pending_ops: list[dict] = []
     with state.store.transaction() as sess:
         svc = FolderService(sess)
         try:
@@ -231,7 +265,10 @@ def move_folder(body: MoveFolderReq, state: AppState = Depends(get_state)):
             raise HTTPException(403, str(e))
         except FolderError as e:
             raise HTTPException(400, str(e))
-        return _folder_to_out(svc, updated)
+        out = _folder_to_out(svc, updated)
+        pending_ops = list(svc.pending_sync_ops)
+    _apply_post_commit_cross_store(pending_ops, state)
+    return out
 
 
 @router.delete("", response_model=FolderOut)
@@ -241,6 +278,7 @@ def delete_folder(
 ):
     """Soft-delete: move the folder (and its whole subtree) into /__trash__."""
     perm = PermissionService(state.store)
+    pending_ops: list[dict] = []
     with state.store.transaction() as sess:
         svc = FolderService(sess)
         try:
@@ -252,4 +290,7 @@ def delete_folder(
             trashed = svc.move_to_trash(folder.folder_id)
         except FolderIsSystemProtected as e:
             raise HTTPException(403, str(e))
-        return _folder_to_out(svc, trashed)
+        out = _folder_to_out(svc, trashed)
+        pending_ops = list(svc.pending_sync_ops)
+    _apply_post_commit_cross_store(pending_ops, state)
+    return out
