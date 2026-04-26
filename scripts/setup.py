@@ -52,31 +52,72 @@ if str(_ROOT) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# Optional backend → required package (import_name, pip_name)
+# Yaml → optional pip package list
+#
+# All optional backends (vector stores, graph, blob, parser, embedder) ship
+# with their pip dependency NOT in requirements.txt. The user only installs
+# what their yaml actually selects. ``dependencies_for(cfg)`` is the single
+# source of truth — both the wizard and ``--sync-deps`` use it.
 # ---------------------------------------------------------------------------
 
-_RELATIONAL_PACKAGES: dict[str, tuple[str, str]] = {
-    "postgres": ("psycopg", "psycopg[binary]"),
-}
 
-_VECTOR_PACKAGES: dict[str, tuple[str, str]] = {
-    "chromadb": ("chromadb", "chromadb"),
-    "qdrant": ("qdrant_client", "qdrant-client"),
-    "milvus": ("pymilvus", "pymilvus"),
-    "weaviate": ("weaviate", "weaviate-client"),
-    "pgvector": ("psycopg", "psycopg[binary]"),
-}
+def dependencies_for(cfg: dict[str, Any]) -> list[tuple[str, str]]:
+    """Map a yaml config dict to the (import_name, pip_name) pairs the
+    deployment needs at runtime. Order matters only for log readability;
+    the resolver de-dups on import_name so pgvector + postgres don't
+    install psycopg twice.
+    """
+    out: list[tuple[str, str]] = []
 
-_BLOB_PACKAGES: dict[str, tuple[str, str]] = {
-    "s3": ("boto3", "boto3"),
-    "oss": ("oss2", "oss2"),
-}
+    rel_backend = (cfg.get("persistence", {}).get("relational", {}).get("backend")) or "postgres"
+    if rel_backend == "postgres":
+        out.append(("psycopg", "psycopg[binary]"))
+
+    vec_backend = (cfg.get("persistence", {}).get("vector", {}).get("backend")) or "pgvector"
+    vec_pkg = {
+        "pgvector":  ("psycopg",       "psycopg[binary]"),
+        "chromadb":  ("chromadb",      "chromadb"),
+        "qdrant":    ("qdrant_client", "qdrant-client"),
+        "milvus":    ("pymilvus",      "pymilvus"),
+        "weaviate":  ("weaviate",      "weaviate-client"),
+    }.get(vec_backend)
+    if vec_pkg:
+        out.append(vec_pkg)
+
+    graph_backend = (cfg.get("graph", {}).get("backend")) or "neo4j"
+    if graph_backend == "neo4j":
+        out.append(("neo4j", "neo4j"))
+
+    blob_mode = (cfg.get("storage", {}).get("mode")) or "local"
+    if blob_mode == "s3":
+        out.append(("boto3", "boto3"))
+    elif blob_mode == "oss":
+        out.append(("oss2", "oss2"))
+
+    parser_backend = (cfg.get("parser", {}).get("backend")) or "pymupdf"
+    if parser_backend in ("mineru", "mineru-vlm"):
+        out.append(("mineru", "mineru"))
+
+    embedder_backend = (cfg.get("embedder", {}).get("backend")) or "litellm"
+    if embedder_backend == "sentence_transformers":
+        out.append(("sentence_transformers", "sentence-transformers"))
+
+    # De-dup on import_name (preserves first-seen order)
+    seen = set()
+    deduped: list[tuple[str, str]] = []
+    for imp, pip_name in out:
+        if imp in seen:
+            continue
+        seen.add(imp)
+        deduped.append((imp, pip_name))
+    return deduped
 
 
-def _ensure_package(import_name: str, pip_name: str) -> None:
-    """Install *pip_name* if *import_name* cannot be imported."""
+def _ensure_package(import_name: str, pip_name: str) -> bool:
+    """Install *pip_name* if *import_name* cannot be imported.
+    Returns True if a fresh install was performed, False if already present."""
     if importlib.util.find_spec(import_name) is not None:
-        return
+        return False
     print(_c(_t(
         f"  '{pip_name}' is not installed — installing now…",
         f"  '{pip_name}' 未安装 — 现在自动安装…",
@@ -90,6 +131,7 @@ def _ensure_package(import_name: str, pip_name: str) -> None:
             f"  '{pip_name}' installed successfully.",
             f"  '{pip_name}' 已安装成功。",
         ), "green"))
+        return True
     except subprocess.CalledProcessError as exc:
         print(_c(_t(
             f"  failed to install '{pip_name}': {exc}",
@@ -99,14 +141,28 @@ def _ensure_package(import_name: str, pip_name: str) -> None:
             f"  install it manually and re-run: pip install {pip_name}",
             f"  请手动安装后重试：pip install {pip_name}",
         ), "dim"))
+        return False
 
 
-def _ensure_backend_package(mapping: dict[str, tuple[str, str]], backend: str) -> None:
-    """Look up *mapping* and install its package if missing."""
-    if backend not in mapping:
-        return
-    import_name, pip_name = mapping[backend]
-    _ensure_package(import_name, pip_name)
+def sync_dependencies(cfg: dict[str, Any]) -> tuple[int, int]:
+    """Walk dependencies_for(cfg) and install each missing one.
+    Returns (newly_installed_count, total_required_count)."""
+    deps = dependencies_for(cfg)
+    if not deps:
+        print(_c(_t(
+            "  No optional packages required for this configuration.",
+            "  当前配置无需安装额外的可选依赖。",
+        ), "dim"))
+        return 0, 0
+    print(_c(_t(
+        f"  Resolving {len(deps)} optional package(s) from yaml…",
+        f"  根据 yaml 解析 {len(deps)} 个可选依赖…",
+    ), "dim"))
+    installed = 0
+    for imp, pip_name in deps:
+        if _ensure_package(imp, pip_name):
+            installed += 1
+    return installed, len(deps)
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +703,6 @@ def _step_relational(answers: dict, defaults: dict) -> None:
             _t("SQLite database file path", "SQLite 数据库文件路径"),
             default=defaults.get("sqlite_path", "./storage/forgerag.db"),
         )
-    _ensure_backend_package(_RELATIONAL_PACKAGES, answers["relational"])
 
 
 def _step_vector(answers: dict, defaults: dict) -> None:
@@ -697,7 +752,6 @@ def _step_vector(answers: dict, defaults: dict) -> None:
             _t("Weaviate server URL", "Weaviate 服务器 URL"),
             default=defaults.get("weaviate_url", "http://localhost:8080"),
         )
-    _ensure_backend_package(_VECTOR_PACKAGES, answers["vector"])
 
 
 def _step_blob(answers: dict, defaults: dict) -> None:
@@ -742,7 +796,6 @@ def _step_blob(answers: dict, defaults: dict) -> None:
             _t("Public base URL (optional)", "公共 base URL (可选)"),
             default="", allow_empty=True,
         )
-    _ensure_backend_package(_BLOB_PACKAGES, answers["blob"])
 
 
 def _ask_credentials(
@@ -978,13 +1031,8 @@ def _step_parser_backend(answers: dict, defaults: dict) -> None:
         ],
         default=defaults.get("parser_backend", "pymupdf"),
     )
-    if answers["parser_backend"] in ("mineru", "mineru-vlm"):
-        from importlib.util import find_spec
-        if find_spec("mineru") is None:
-            print(_c(_t(
-                "  Note: 'mineru' Python package not detected — will be installed on first run.",
-                "  提示：未检测到 'mineru' Python 包 — 首次运行时会自动安装。",
-            ), "yellow"))
+    # 'mineru' install (if missing) is handled by sync_dependencies after
+    # the wizard finishes — no per-step check needed.
     if answers["parser_backend"] == "mineru-vlm":
         url = ask(
             _t("Remote VLM server URL (leave blank for local inference)",
@@ -1509,11 +1557,57 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite output file if it already exists.",
     )
+    p.add_argument(
+        "--sync-deps",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Skip the wizard. Read PATH (existing forgerag.yaml), "
+            "compute the optional pip packages it requires, and "
+            "install any that are missing. Useful after a yaml edit."
+        ),
+    )
     return p.parse_args()
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    try:
+        import yaml
+    except ImportError as e:
+        raise RuntimeError("pyyaml not installed: pip install pyyaml") from e
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
 def main() -> int:
     args = parse_args()
+
+    # ── --sync-deps: standalone path, no wizard ──
+    if args.sync_deps is not None:
+        path = args.sync_deps
+        if not path.exists():
+            print(_c(_t(
+                f"  {path} not found.",
+                f"  未找到 {path}。",
+            ), "magenta"))
+            return 2
+        try:
+            cfg_dict = _load_yaml(path)
+        except Exception as e:
+            print(_c(_t(
+                f"  failed to read {path}: {e}",
+                f"  读取 {path} 失败：{e}",
+            ), "magenta"))
+            return 1
+        section(_t("Syncing optional dependencies", "同步可选依赖"))
+        installed, total = sync_dependencies(cfg_dict)
+        print()
+        print(_c(_t(
+            f"  {installed}/{total} package(s) installed (others already present).",
+            f"  本次安装 {installed}/{total} 个包（其余已就位）。",
+        ), "green"))
+        return 0
 
     # Pick the wizard's display language before any other output. Skipped
     # entirely in non-interactive mode (CI / Docker) where English is the
@@ -1548,6 +1642,12 @@ def main() -> int:
     print()
     print(_c(_t(f"  wrote {args.output}", f"  已写入 {args.output}"), "green"))
     print()
+
+    # Now that we know exactly what backends the user picked, install only
+    # those optional packages — the user did not have to ``pip install -r``
+    # anything beyond the small core set.
+    section(_t("Installing optional dependencies", "安装可选依赖"))
+    sync_dependencies(cfg_dict)
 
     try:
         post_setup(args.output)

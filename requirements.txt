@@ -1,3 +1,10 @@
+# Core dependencies — every deployment needs these. Optional backend
+# packages (vector stores / graph DBs / blob clients / parser) are NOT
+# listed here: ``python scripts/setup.py`` derives them from the yaml the
+# user generates and ``pip install``s only what's actually selected.
+# ``python scripts/setup.py --sync-deps myconfig.yaml`` re-runs that
+# resolver against an existing config without re-running the wizard.
+#
 # ── Core ──────────────────────────────────────────────────────────────────────
 fastapi>=0.115
 pydantic>=2.0

@@ -118,18 +118,21 @@ Compared to heavier platforms like RAGFlow, ForgeRAG focuses on **core pipeline 
 git clone https://github.com/deeplethe/ForgeRAG.git
 cd ForgeRAG
 
-# Python dependencies
+# 1. Core Python dependencies (small — the heavy backend packages are
+#    installed lazily in step 3 based on what your config actually picks).
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# Frontend
+# 2. Frontend
 cd web && npm install && npm run build && cd ..
 
-# Configure (interactive wizard: pick provider, set keys, done)
+# 3. Configure: interactive wizard generates forgerag.yaml AND auto-pip-installs
+#    the backend-specific deps your choices need (e.g. chromadb, neo4j, mineru).
+#    To re-sync deps after a manual yaml edit: python scripts/setup.py --sync-deps forgerag.yaml
 python scripts/setup.py
 
-# Run (use multiple workers for responsive UI during ingestion)
+# 4. Run (use multiple workers for responsive UI during ingestion)
 python main.py --workers 4
 ```
 
