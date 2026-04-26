@@ -121,7 +121,8 @@ def ingest_document(
         raise HTTPException(404, f"file {req.file_id} not found")
 
     doc_id = req.doc_id or f"doc_{req.file_id[:12]}"
-    name = file_row.get("display_name", "upload.bin")
+    # FileStore guarantees display_name is always populated.
+    name = file_row["display_name"]
     ext = _Path(name).suffix.lower().lstrip(".")
     fmt = {
         "pdf": "pdf", "docx": "docx", "doc": "docx",

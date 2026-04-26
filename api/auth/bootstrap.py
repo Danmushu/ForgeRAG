@@ -42,41 +42,49 @@ def bootstrap_if_empty(cfg, store) -> None:
         return
 
     from sqlalchemy import func, select
+    from sqlalchemy.exc import IntegrityError
 
     from persistence.models import AuthToken, AuthUser
 
-    with store.transaction() as sess:
-        existing = sess.execute(select(func.count()).select_from(AuthUser)).scalar() or 0
-        if existing > 0:
-            return
+    try:
+        with store.transaction() as sess:
+            existing = sess.execute(select(func.count()).select_from(AuthUser)).scalar() or 0
+            if existing > 0:
+                return
 
-        # Create admin user
-        user_id = _new_id()
-        admin = AuthUser(
-            user_id=user_id,
-            username="admin",
-            password_hash=hash_password(cfg.auth.initial_password),
-            must_change_password=True,
-            role="admin",
-            is_active=True,
-        )
-        sess.add(admin)
-        # Flush so the user row exists before we insert the token that
-        # FK-references it (SQLAlchemy's unit-of-work ordering isn't
-        # guaranteed across independent objects in the same commit).
-        sess.flush()
+            # Create admin user
+            user_id = _new_id()
+            admin = AuthUser(
+                user_id=user_id,
+                username="admin",
+                password_hash=hash_password(cfg.auth.initial_password),
+                must_change_password=True,
+                role="admin",
+                is_active=True,
+            )
+            sess.add(admin)
+            # Flush so the user row exists before we insert the token that
+            # FK-references it (SQLAlchemy's unit-of-work ordering isn't
+            # guaranteed across independent objects in the same commit).
+            sess.flush()
 
-        # Mint one initial token
-        raw = generate_sk()
-        token = AuthToken(
-            token_id=_new_id(),
-            user_id=user_id,
-            name="bootstrap",
-            token_hash=hash_sk(raw),
-            hash_prefix=hash_prefix(raw),
-            role="admin",
-        )
-        sess.add(token)
+            # Mint one initial token
+            raw = generate_sk()
+            token = AuthToken(
+                token_id=_new_id(),
+                user_id=user_id,
+                name="bootstrap",
+                token_hash=hash_sk(raw),
+                hash_prefix=hash_prefix(raw),
+                role="admin",
+            )
+            sess.add(token)
+    except IntegrityError:
+        # Another worker won the bootstrap race — the username UNIQUE
+        # constraint kicked in. Idempotent: just return so startup
+        # continues normally instead of crashing the second worker.
+        log.info("auth bootstrap: another worker already created the admin user; skipping")
+        return
 
     # One-time stdout banner — use print, not logger, so it's visible
     # even when log level hides INFO, and the format survives JSON

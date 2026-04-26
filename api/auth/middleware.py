@@ -25,6 +25,7 @@ On failure, 401 with ``WWW-Authenticate: Bearer`` header.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -36,6 +37,25 @@ from starlette.responses import JSONResponse
 from .primitives import hash_sk
 
 log = logging.getLogger(__name__)
+
+
+def _peer_in_trusted_cidrs(peer_host: str | None, cidrs: list[str]) -> bool:
+    """True iff *peer_host* falls inside one of the configured CIDRs."""
+    if not peer_host:
+        return False
+    try:
+        addr = ipaddress.ip_address(peer_host)
+    except ValueError:
+        return False
+    for raw in cidrs:
+        try:
+            net = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            log.warning("auth.forwarded_trusted_proxy_cidrs: invalid CIDR %r — ignoring", raw)
+            continue
+        if addr in net:
+            return True
+    return False
 
 
 class AuthError(Exception):
@@ -202,6 +222,21 @@ async def _authenticate(request: Request, cfg, store) -> AuthenticatedPrincipal 
     if cfg.mode == "forwarded":
         fwd = request.headers.get(cfg.forwarded_user_header)
         if fwd:
+            # SSRF / spoofing defence: only trust the header when the
+            # immediate peer is in the operator's trusted-proxy list.
+            # Empty list = no source restriction (only safe with strict
+            # network isolation; documented in auth_config.py).
+            trusted = list(getattr(cfg, "forwarded_trusted_proxy_cidrs", []) or [])
+            if trusted:
+                peer = request.client.host if request.client else None
+                if not _peer_in_trusted_cidrs(peer, trusted):
+                    log.warning(
+                        "rejecting %s header from untrusted peer %s "
+                        "(set auth.forwarded_trusted_proxy_cidrs to permit)",
+                        cfg.forwarded_user_header,
+                        peer,
+                    )
+                    raise AuthError("forwarded auth from untrusted source", status=403)
             # Upsert a user row on first sight — the proxy is the auth
             # source of truth; we just need a local identity for scoping
             # tokens and sessions.
@@ -211,11 +246,12 @@ async def _authenticate(request: Request, cfg, store) -> AuthenticatedPrincipal 
                 ).scalar_one_or_none()
                 if row is None:
                     import uuid
+                    default_role = getattr(cfg, "forwarded_default_role", "viewer")
                     row = AuthUser(
                         user_id=uuid.uuid4().hex[:16],
                         username=fwd,
                         password_hash="",   # never logs in with password
-                        role="admin",       # trust the upstream proxy
+                        role=default_role,  # operator promotes to admin via Tokens UI
                         is_active=True,
                         must_change_password=False,
                     )

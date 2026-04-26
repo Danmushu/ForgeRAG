@@ -209,7 +209,7 @@ class AnsweringPipeline:
         # Inject conversation history into messages (multi-turn).
         # Reuse chat_history loaded earlier (no new messages since then).
         if conversation_id and chat_history:
-            messages = self._inject_history(messages, chat_history)
+            messages = self._inject_history(messages, chat_history, current_query=query)
             stats["history_turns"] = len(chat_history) // 2
 
         # If no context chunks AND intent requires documents, refuse.
@@ -561,7 +561,7 @@ class AnsweringPipeline:
 
         # Reuse chat_history loaded earlier (no new messages since then).
         if conversation_id and chat_history:
-            messages = self._inject_history(messages, chat_history)
+            messages = self._inject_history(messages, chat_history, current_query=query)
 
         # Emit retrieval metadata
         yield {
@@ -784,6 +784,8 @@ class AnsweringPipeline:
         self,
         messages: list[dict],
         history: list[dict],
+        *,
+        current_query: str | None = None,
     ) -> list[dict]:
         """
         Insert conversation history between system and user messages.
@@ -791,9 +793,22 @@ class AnsweringPipeline:
 
         Layout:
             [system] → [history user/assistant pairs] → [user with context]
+
+        ``current_query`` is the user query that build_messages already
+        rendered into the trailing user message. Because callers persist
+        the user message before loading history, the newest entry is the
+        same query — drop it here so it doesn't appear twice in the prompt.
         """
         if not history:
             return messages
+
+        # Drop trailing user entries that match the current query.
+        if current_query is not None:
+            cq = current_query.strip()
+            while history and history[-1].get("role") == "user" and (history[-1].get("content") or "").strip() == cq:
+                history = history[:-1]
+            if not history:
+                return messages
 
         system = messages[0] if messages and messages[0]["role"] == "system" else None
         rest = messages[1:] if system else messages

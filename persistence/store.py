@@ -474,6 +474,18 @@ class Store:
             row = s.get(ParsedBlock, block_id)
             return _block_to_dict(row) if row else None
 
+    def get_blocks_by_ids(self, block_ids: list[str]) -> list[dict]:
+        """Bulk lookup; mirrors the get_chunks_by_ids batching strategy."""
+        if not block_ids:
+            return []
+        results: list[dict] = []
+        with self._session() as s:
+            for i in range(0, len(block_ids), 500):
+                batch = block_ids[i : i + 500]
+                rows = s.execute(select(ParsedBlock).where(ParsedBlock.block_id.in_(batch))).scalars().all()
+                results.extend(_block_to_dict(r) for r in rows)
+        return results
+
     # =======================================================================
     # Trees
     # =======================================================================

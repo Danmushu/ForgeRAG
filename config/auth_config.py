@@ -44,6 +44,24 @@ class AuthConfig(BaseModel):
 
     # --- mode=forwarded ---
     forwarded_user_header: str = "X-Forwarded-User"
+    # SSRF / spoofing defence for ``mode=forwarded``: only accept the
+    # forwarded header when the immediate peer (request.client.host)
+    # matches one of these CIDRs. Empty = ACCEPT FROM ANYONE — only safe
+    # if the server is bound to 127.0.0.1 with the proxy on the same host
+    # AND no other process can reach the bind address. Recommended for
+    # any non-toy deployment: list the proxy's egress IP(s) explicitly.
+    forwarded_trusted_proxy_cidrs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "CIDR(s) the upstream OAuth proxy connects from. The "
+            "X-Forwarded-User header is honoured only when the request's "
+            "immediate client.host matches one of these. Empty = accept "
+            "from any source (only safe with strict network isolation)."
+        ),
+    )
+    # New auto-provisioned forwarded users start with this role rather than
+    # 'admin' — the operator can promote later via the Tokens UI.
+    forwarded_default_role: Literal["admin", "viewer"] = "viewer"
 
     # Paths that bypass auth even when enabled (health probes, static assets).
     # Matched as path prefix. /api/v1/auth/login obviously also bypasses
