@@ -10,7 +10,6 @@ without committing a binary fixture to the repo.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -20,10 +19,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Production ForgeRAG refuses sqlite; pytest fixtures still build in-memory
-# SQLite stores for fast unit tests, so flip the escape hatch globally for
-# the whole test session.
-os.environ.setdefault("TESTING_ALLOW_SQLITE", "1")
 
 
 @pytest.fixture(scope="session")

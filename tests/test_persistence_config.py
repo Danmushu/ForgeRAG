@@ -2,28 +2,10 @@
 
 from __future__ import annotations
 
-import os
-from contextlib import contextmanager
-
 import pytest
 
 from config import PersistenceConfig, RelationalConfig, VectorConfig
 from config.persistence import ChromaConfig, SQLiteConfig
-
-
-@contextmanager
-def _allow_sqlite_for_tests():
-    """Test helper: toggle the TESTING_ALLOW_SQLITE flag so the config
-    validator accepts sqlite inside pytest. Production code always rejects."""
-    original = os.environ.get("TESTING_ALLOW_SQLITE")
-    os.environ["TESTING_ALLOW_SQLITE"] = "1"
-    try:
-        yield
-    finally:
-        if original is None:
-            os.environ.pop("TESTING_ALLOW_SQLITE", None)
-        else:
-            os.environ["TESTING_ALLOW_SQLITE"] = original
 
 
 class TestDefaults:
@@ -46,24 +28,29 @@ class TestValidCombinations:
         )
         assert cfg.vector.backend == "chromadb"
 
-    def test_sqlite_under_test_env(self):
-        """sqlite is only allowed when TESTING_ALLOW_SQLITE=1 is set."""
-        with _allow_sqlite_for_tests():
-            cfg = RelationalConfig(backend="sqlite", sqlite=SQLiteConfig())
-            assert cfg.backend == "sqlite"
-            assert cfg.sqlite is not None
+    def test_sqlite_accepted_directly(self):
+        """SQLite is a first-class backend now (single-worker deployments)."""
+        cfg = RelationalConfig(backend="sqlite", sqlite=SQLiteConfig())
+        assert cfg.backend == "sqlite"
+        assert cfg.sqlite is not None
+
+    def test_sqlite_autofills_section(self):
+        """Mirror of the postgres autofill: backend=sqlite without a body
+        gets the default SQLiteConfig populated by the validator."""
+        cfg = RelationalConfig(backend="sqlite")
+        assert cfg.sqlite is not None
+        assert cfg.sqlite.path.endswith(".db")
 
 
 class TestInvalidCombinations:
-    def test_sqlite_rejected_in_production(self):
-        """Without TESTING_ALLOW_SQLITE the config validator must reject sqlite."""
-        original = os.environ.pop("TESTING_ALLOW_SQLITE", None)
-        try:
-            with pytest.raises(ValueError, match="test-only"):
-                RelationalConfig(backend="sqlite", sqlite=SQLiteConfig())
-        finally:
-            if original is not None:
-                os.environ["TESTING_ALLOW_SQLITE"] = original
+    def test_sqlite_with_pgvector_rejected(self):
+        """pgvector is in-database, so it requires backend=postgres.
+        SQLite users must pick chroma / qdrant / milvus / weaviate."""
+        with pytest.raises(ValueError, match="pgvector"):
+            PersistenceConfig(
+                relational=RelationalConfig(backend="sqlite", sqlite=SQLiteConfig()),
+                vector=VectorConfig(backend="pgvector"),
+            )
 
     def test_chromadb_without_section_rejected(self):
         with pytest.raises(ValueError, match="chromadb section missing"):

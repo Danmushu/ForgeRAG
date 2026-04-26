@@ -1,26 +1,32 @@
 """
 Persistence configuration.
 
-ForgeRAG production runtime requires PostgreSQL.  SQLite remains
-available for the test suite only (see TESTING_ALLOW_SQLITE env var);
-MySQL has been removed entirely.
+Two relational backends, both fully supported by the unified SQLAlchemy
+2.0 store layer:
 
-    relational.backend:  "postgres"  (production)
-    vector.backend:      "pgvector" | "chromadb" | "qdrant" | "milvus" | "weaviate"
+  * **postgres** — production default. Multi-worker safe, full SQL
+                   feature set, eligible for pgvector co-location.
+  * **sqlite**   — single-process WAL-mode SQLite. Good for dev / demo /
+                   the test suite. Multi-worker uvicorn deployments
+                   should prefer postgres because SQLite serialises all
+                   writes (WAL helps reads but writers still queue).
+                   Incompatible with ``vector.backend=pgvector`` —
+                   pgvector lives inside postgres.
 
 Credentials: prefer postgres.password_env over plaintext password.
 The store factory reads the env var at connect time.
 
-NOTE: The SQLiteConfig class is retained so pytest fixtures can still
-construct ephemeral in-memory DBs for fast unit tests, but the main
-config validator rejects sqlite in normal runtime.
+MySQL support was removed.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Relational
@@ -48,16 +54,11 @@ class SQLiteConfig(BaseModel):
     synchronous: Literal["off", "normal", "full"] = "normal"
 
 
-import os
-
-
 class RelationalConfig(BaseModel):
     """
-    Production: postgres only.
-
-    sqlite is still accepted inside the test-suite (env var
-    TESTING_ALLOW_SQLITE=1 set by pytest fixtures); anywhere else it
-    raises. MySQL support has been removed.
+    Postgres for multi-worker production; SQLite for single-process
+    deployments / dev / tests. The ``Store`` (SQLAlchemy 2.0) speaks
+    to both with the same code path.
     """
 
     backend: Literal["postgres", "sqlite"] = "postgres"
@@ -70,15 +71,14 @@ class RelationalConfig(BaseModel):
         if self.backend == "postgres" and self.postgres is None:
             self.postgres = PostgresConfig()
         if self.backend == "sqlite":
-            # Test-only escape hatch; reject in production environments.
-            if os.environ.get("TESTING_ALLOW_SQLITE") != "1":
-                raise ValueError(
-                    "relational.backend=sqlite is test-only. Production "
-                    "ForgeRAG runs on PostgreSQL. Set TESTING_ALLOW_SQLITE=1 "
-                    "to use SQLite from a pytest fixture."
-                )
             if self.sqlite is None:
                 self.sqlite = SQLiteConfig()
+            log.warning(
+                "relational.backend=sqlite selected. SQLite serialises all "
+                "writes — running uvicorn with --workers > 1 will queue writers "
+                "behind one another. Switch to PostgreSQL for multi-worker "
+                "production deployments."
+            )
         return self
 
 

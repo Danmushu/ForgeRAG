@@ -598,25 +598,50 @@ class Store:
         return results
 
     def find_chunk_by_block_id(self, doc_id: str, parse_version: int, block_id: str) -> dict | None:
-        """Find the chunk that contains a given block_id (JSONB @> query)."""
-        from sqlalchemy import type_coerce
-        from sqlalchemy.dialects.postgresql import JSONB
+        """Find the chunk that contains a given block_id.
 
+        Postgres path: ``JSONB @> [block_id]`` containment, indexed.
+        Other dialects (SQLite): fetch the doc's chunks and Python-filter.
+        Per-doc chunks are bounded (typically <500), so the linear scan
+        is fine; SQLite deployments are usually single-process anyway.
+        """
+        if self.backend == "postgres":
+            from sqlalchemy import type_coerce
+            from sqlalchemy.dialects.postgresql import JSONB
+
+            with self._session() as s:
+                row = (
+                    s.execute(
+                        select(ChunkRow)
+                        .where(
+                            ChunkRow.doc_id == doc_id,
+                            ChunkRow.parse_version == parse_version,
+                            type_coerce(ChunkRow.block_ids, JSONB).contains([block_id]),
+                        )
+                        .limit(1)
+                    )
+                    .scalars()
+                    .first()
+                )
+                return _chunk_to_dict(row) if row else None
+
+        # Portable fallback — used by SQLite and any future dialect that
+        # lacks JSONB containment.
         with self._session() as s:
-            row = (
+            rows = (
                 s.execute(
-                    select(ChunkRow)
-                    .where(
+                    select(ChunkRow).where(
                         ChunkRow.doc_id == doc_id,
                         ChunkRow.parse_version == parse_version,
-                        type_coerce(ChunkRow.block_ids, JSONB).contains([block_id]),
                     )
-                    .limit(1)
                 )
                 .scalars()
-                .first()
+                .all()
             )
-            return _chunk_to_dict(row) if row else None
+        for r in rows:
+            if r.block_ids and block_id in r.block_ids:
+                return _chunk_to_dict(r)
+        return None
 
     def get_chunks_by_node_ids(self, node_ids: list[str]) -> list[dict]:
         if not node_ids:

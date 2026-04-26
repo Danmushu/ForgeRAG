@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 from sqlalchemy import select
-
-os.environ["TESTING_ALLOW_SQLITE"] = "1"
 
 from config.persistence import RelationalConfig, SQLiteConfig
 from persistence.folder_service import (
@@ -29,7 +25,6 @@ from persistence.folder_service import (
 )
 from persistence.models import Document, Folder
 from persistence.store import Store
-
 
 # ---------------------------------------------------------------------------
 # Helpers for path math (pure — no DB)

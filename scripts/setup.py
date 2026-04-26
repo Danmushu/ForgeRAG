@@ -467,16 +467,23 @@ def _profile_defaults(profile: str) -> dict[str, Any]:
         "llm_api_base": "",
     }
     if profile == "dev":
+        # Zero extra services — single-process, file-persisted, fast bootstrap.
         return {
             **base,
+            "relational": "sqlite",
+            "sqlite_path": "./storage/forgerag.db",
             "vector": "chromadb",
             "chroma_dir": "./storage/chroma",
+            "graph_backend": "networkx",
+            "networkx_path": "./storage/kg.json",
             "blob": "local",
             "blob_root": "./storage/blobs",
+            "parser_backend": "pymupdf",
         }
     if profile == "prod":
         return {
             **base,
+            "relational": "postgres",
             "pg_host": "localhost",
             "pg_port": 5432,
             "pg_database": "forgerag",
@@ -484,8 +491,14 @@ def _profile_defaults(profile: str) -> dict[str, Any]:
             "pg_password_env": "PG_PASSWORD",
             "vector": "pgvector",
             "embedder_dim": 1024,
+            "graph_backend": "neo4j",
+            "neo4j_uri": "bolt://localhost:7687",
+            "neo4j_user": "neo4j",
+            "neo4j_password_env": "NEO4J_PASSWORD",
+            "neo4j_database": "neo4j",
             "blob": "local",
             "blob_root": "./storage/blobs",
+            "parser_backend": "pymupdf",
         }
     return {}
 
@@ -605,20 +618,35 @@ def _confirm_test_failure(target_en: str, target_zh: str, error: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _step_postgres(answers: dict, defaults: dict) -> None:
-    answers["relational"] = "postgres"
-    answers["pg_host"] = ask(_t("Postgres host", "Postgres 主机"),
-        default=defaults.get("pg_host", "localhost"))
-    answers["pg_port"] = ask_int(_t("Postgres port", "Postgres 端口"),
-        default=defaults.get("pg_port", 5432))
-    answers["pg_database"] = ask(_t("Postgres database", "Postgres 数据库名"),
-        default=defaults.get("pg_database", "forgerag"))
-    answers["pg_user"] = ask(_t("Postgres user", "Postgres 用户名"),
-        default=defaults.get("pg_user", "forgerag"))
-    answers["pg_password_env"] = ask(
-        _t("Env var containing the password", "存放密码的环境变量名"),
-        default=defaults.get("pg_password_env", "PG_PASSWORD"),
+def _step_relational(answers: dict, defaults: dict) -> None:
+    answers["relational"] = ask_choice(
+        _t("Which metadata database?", "选择元数据库后端？"),
+        [
+            ("postgres", _t("PostgreSQL — multi-worker safe, recommended for production",
+                            "PostgreSQL — 多 worker 安全，生产推荐")),
+            ("sqlite",   _t("SQLite — single-process, zero extra services (dev / demo)",
+                            "SQLite — 单进程，无需额外服务（dev / demo）")),
+        ],
+        default=defaults.get("relational", "postgres"),
     )
+    if answers["relational"] == "postgres":
+        answers["pg_host"] = ask(_t("Postgres host", "Postgres 主机"),
+            default=defaults.get("pg_host", "localhost"))
+        answers["pg_port"] = ask_int(_t("Postgres port", "Postgres 端口"),
+            default=defaults.get("pg_port", 5432))
+        answers["pg_database"] = ask(_t("Postgres database", "Postgres 数据库名"),
+            default=defaults.get("pg_database", "forgerag"))
+        answers["pg_user"] = ask(_t("Postgres user", "Postgres 用户名"),
+            default=defaults.get("pg_user", "forgerag"))
+        answers["pg_password_env"] = ask(
+            _t("Env var containing the password", "存放密码的环境变量名"),
+            default=defaults.get("pg_password_env", "PG_PASSWORD"),
+        )
+    else:
+        answers["sqlite_path"] = ask(
+            _t("SQLite database file path", "SQLite 数据库文件路径"),
+            default=defaults.get("sqlite_path", "./storage/forgerag.db"),
+        )
     _ensure_backend_package(_RELATIONAL_PACKAGES, answers["relational"])
 
 
@@ -633,11 +661,15 @@ def _step_vector(answers: dict, defaults: dict) -> None:
         ("weaviate", _t("Weaviate — multi-modal, GraphQL API",
                         "Weaviate — 多模态，GraphQL API")),
     ]
-    valid = [
-        ("pgvector", _t("pgvector — in-database, zero extra ops",
-                        "pgvector — 直接在 Postgres 内，无额外运维")),
-        *standalone,
-    ]
+    # pgvector lives inside Postgres — only offer it when relational is postgres.
+    if answers.get("relational") == "postgres":
+        valid = [
+            ("pgvector", _t("pgvector — in-database, zero extra ops",
+                            "pgvector — 直接在 Postgres 内，无额外运维")),
+            *standalone,
+        ]
+    else:
+        valid = standalone
     default_vec = defaults.get("vector", valid[0][0])
     if default_vec not in [v for v, _ in valid]:
         default_vec = valid[0][0]
@@ -746,6 +778,64 @@ def _ask_credentials(
         allow_empty=True,
     )
     return api_key_env, api_key_plain, api_base
+
+
+def _step_graph(answers: dict, defaults: dict) -> None:
+    """Pick the knowledge-graph backend.
+
+    NetworkX is single-process JSON-persisted (no extra deps). Neo4j is
+    the production choice for multi-worker deployments + larger KGs.
+    Both are feature-equivalent — the same retrieval logic runs on top.
+    """
+    print(_c(_t(
+        "  The knowledge graph stores entity-relation triples extracted",
+        "  知识图谱存储 KG 抽取的实体关系三元组",
+    ), "dim"))
+    print(_c(_t(
+        "  during ingestion. Neo4j is the production-grade choice;",
+        "  入库时生成。Neo4j 适合生产部署；",
+    ), "dim"))
+    print(_c(_t(
+        "  NetworkX is a single-process JSON-persisted alternative for",
+        "  NetworkX 是单进程 JSON 持久化的轻量替代，适合",
+    ), "dim"))
+    print(_c(_t(
+        "  dev / demo / single-worker deployments (no extra service).",
+        "  dev / demo / 单 worker 部署（不需要额外服务）。",
+    ), "dim"))
+    answers["graph_backend"] = ask_choice(
+        _t("Which graph backend?", "选择图数据库后端？"),
+        [
+            ("networkx", _t("single-process JSON, zero extra services",
+                            "单进程 JSON，无需额外服务")),
+            ("neo4j",    _t("Neo4j 5.11+, multi-worker safe, recommended for production",
+                            "Neo4j 5.11+，多 worker 安全，生产推荐")),
+        ],
+        default=defaults.get("graph_backend", "networkx"),
+    )
+    if answers["graph_backend"] == "neo4j":
+        answers["neo4j_uri"] = ask(
+            _t("Neo4j Bolt URI", "Neo4j Bolt URI"),
+            default=defaults.get("neo4j_uri", "bolt://localhost:7687"),
+        )
+        answers["neo4j_user"] = ask(
+            _t("Neo4j user", "Neo4j 用户"),
+            default=defaults.get("neo4j_user", "neo4j"),
+        )
+        answers["neo4j_password_env"] = ask(
+            _t("Env var holding the Neo4j password",
+               "存放 Neo4j 密码的环境变量名"),
+            default=defaults.get("neo4j_password_env", "NEO4J_PASSWORD"),
+        )
+        answers["neo4j_database"] = ask(
+            _t("Neo4j database", "Neo4j 数据库名"),
+            default=defaults.get("neo4j_database", "neo4j"),
+        )
+    else:
+        answers["networkx_path"] = ask(
+            _t("NetworkX JSON dump path", "NetworkX JSON 持久化文件路径"),
+            default=defaults.get("networkx_path", "./storage/kg.json"),
+        )
 
 
 def _step_embedder(answers: dict, defaults: dict) -> None:
@@ -949,9 +1039,10 @@ def _step_image_enrichment(answers: dict, defaults: dict) -> None:
 
 
 _STEPS: list[tuple[str, str, Callable[[dict, dict], None]]] = [
-    ("Metadata database (PostgreSQL)", "元数据库 (PostgreSQL)",     _step_postgres),
+    ("Metadata database",              "元数据库",                  _step_relational),
     ("Vector database",                "向量数据库",                _step_vector),
     ("Blob storage",                   "Blob 存储",                 _step_blob),
+    ("Knowledge graph database",       "知识图谱数据库",            _step_graph),
     ("Parser backend",                 "PDF 解析器后端",            _step_parser_backend),
     ("Embedding model",                "向量嵌入模型",              _step_embedder),
     ("Answer-generation LLM",          "答案生成大模型",            _step_llm),
@@ -965,15 +1056,21 @@ def _non_interactive_defaults(profile: str) -> dict[str, Any]:
         return d
     # Fill in fields the per-step functions would normally set so
     # build_config_dict has everything it needs without prompting.
-    d.setdefault("relational", "postgres")
-    d.setdefault("pg_host", "localhost")
-    d.setdefault("pg_port", 5432)
-    d.setdefault("pg_database", "forgerag")
-    d.setdefault("pg_user", "forgerag")
-    d.setdefault("pg_password_env", "PG_PASSWORD")
+    if d.get("relational") == "sqlite":
+        d.setdefault("sqlite_path", "./storage/forgerag.db")
+    else:
+        d.setdefault("relational", "postgres")
+        d.setdefault("pg_host", "localhost")
+        d.setdefault("pg_port", 5432)
+        d.setdefault("pg_database", "forgerag")
+        d.setdefault("pg_user", "forgerag")
+        d.setdefault("pg_password_env", "PG_PASSWORD")
     d.setdefault("blob_root", "./storage/blobs")
     if d.get("vector") == "chromadb":
         d.setdefault("chroma_dir", "./storage/chroma")
+    d.setdefault("graph_backend", "networkx")
+    if d["graph_backend"] == "networkx":
+        d.setdefault("networkx_path", "./storage/kg.json")
     d.setdefault("embedder_api_key", "")
     d.setdefault("llm_api_key", "")
     return d
@@ -1063,14 +1160,18 @@ def build_config_dict(a: dict[str, Any]) -> dict[str, Any]:
     cfg["storage"] = storage
 
     # --- persistence ---
-    rel: dict[str, Any] = {"backend": "postgres"}
-    rel["postgres"] = {
-        "host": a["pg_host"],
-        "port": a["pg_port"],
-        "database": a["pg_database"],
-        "user": a["pg_user"],
-        "password_env": a["pg_password_env"],
-    }
+    rel_backend = a.get("relational", "postgres")
+    rel: dict[str, Any] = {"backend": rel_backend}
+    if rel_backend == "postgres":
+        rel["postgres"] = {
+            "host": a["pg_host"],
+            "port": a["pg_port"],
+            "database": a["pg_database"],
+            "user": a["pg_user"],
+            "password_env": a["pg_password_env"],
+        }
+    else:  # sqlite
+        rel["sqlite"] = {"path": a.get("sqlite_path", "./storage/forgerag.db")}
 
     vec: dict[str, Any] = {"backend": a["vector"]}
     if a["vector"] == "pgvector":
@@ -1111,6 +1212,22 @@ def build_config_dict(a: dict[str, Any]) -> dict[str, Any]:
         }
 
     cfg["persistence"] = {"relational": rel, "vector": vec}
+
+    # --- knowledge graph ---
+    graph_backend = a.get("graph_backend", "networkx")
+    graph_block: dict[str, Any] = {"backend": graph_backend}
+    if graph_backend == "neo4j":
+        graph_block["neo4j"] = {
+            "uri": a.get("neo4j_uri", "bolt://localhost:7687"),
+            "user": a.get("neo4j_user", "neo4j"),
+            "password_env": a.get("neo4j_password_env", "NEO4J_PASSWORD"),
+            "database": a.get("neo4j_database", "neo4j"),
+        }
+    else:
+        graph_block["networkx"] = {
+            "path": a.get("networkx_path", "./storage/kg.json"),
+        }
+    cfg["graph"] = graph_block
 
     # --- embedder ---
     embedder_litellm: dict[str, Any] = {"model": a["embedder_model"]}
