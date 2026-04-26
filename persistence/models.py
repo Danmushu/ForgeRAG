@@ -79,7 +79,7 @@ class Document(Base):
         nullable=True,
     )
     # ── Folder tree membership ──────────────────────────────────────
-    # folder_id is the stable anchor (used for permissions + relationship).
+    # folder_id is the stable anchor (survives rename/move unchanged).
     # path is a cached denormalization for fast prefix queries — kept in
     # sync by FolderService transactions. `__root__` is the default folder.
     folder_id: Mapped[str] = mapped_column(
@@ -353,17 +353,20 @@ class QueryTrace(Base):
 
 
 # ---------------------------------------------------------------------------
-# Folder tree (permission basis + path scoping)
+# Folder tree (retrieval scope)
 # ---------------------------------------------------------------------------
 #
 # Design contract:
 #   - folder_id is the stable anchor. Rename / move never changes it.
 #   - path is a cached denormalization — kept in sync by FolderService.
-#     Permission queries use folder_id; retrieval queries use path.
+#     Path is the retrieval / mutation scope carrier (Chroma, Neo4j, PG all
+#     filter by path prefix). folder_id is only the relational anchor.
 #   - Two built-in system folders seeded by the migration:
 #       __root__   (path='/')       — everything's ancestor
 #       __trash__  (path='/__trash__') — trash bin
 #   - A document always belongs to exactly one folder. "No folder" = __root__.
+#   - Single-tenant: there is no access-control layer planned. See
+#     persistence/scope.py for why the FolderGrant model below is dormant.
 
 
 class Folder(Base):
@@ -397,9 +400,13 @@ class Folder(Base):
 
 class FolderGrant(Base):
     """
-    Permission grants on folders. Phase 1: table exists but permission
-    checks always return True (single-user mode). Phase 2+: authenticated
-    user_id + role-based evaluation with inheritance up the folder tree.
+    DORMANT — kept only to avoid a schema migration. Originally designed for
+    a Phase-2 ACL that we've since decided against: ForgeRAG is single-tenant
+    and folder path is retrieval *scope*, not authZ (see persistence/scope.py).
+
+    The table has a single bootstrap row inserted by Store._seed and is never
+    read. Safe to drop in a future migration once we're ready to touch the
+    schema.
     """
 
     __tablename__ = "folder_grants"
@@ -469,6 +476,86 @@ class PendingFolderOp(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     error_msg: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Auth (users / API tokens / web sessions)
+# ---------------------------------------------------------------------------
+# Design contract:
+#   - Single-tenant today (one row in auth_users), but the schema is
+#     multi-user-ready — adding more rows later needs no migration.
+#   - Password hashes use argon2id; NEVER store plaintext.
+#   - API tokens: we store sha256(raw_bearer); the plaintext is shown
+#     exactly once at creation time and never retrievable.
+#   - Sessions: opaque random ID, DB-backed, no TTL. Logout revokes the
+#     current session; password change revokes all OTHER sessions.
+# ---------------------------------------------------------------------------
+
+
+class AuthUser(Base):
+    """Single or multi tenant user record. Admin-bootstrapped on first
+    boot when ``auth.enabled=true`` and this table is empty."""
+
+    __tablename__ = "auth_users"
+
+    user_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))           # argon2id
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    role: Mapped[str] = mapped_column(String(16), default="admin", server_default="admin")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AuthToken(Base):
+    """Bearer token for CLI / SDK auth.
+
+    ``token_hash`` = sha256(raw_bearer). We generate ``Forge_<32B base58>``
+    tokens (~44 chars printable) and store only the hash. Revocation is
+    a soft-delete via ``revoked_at``.
+    """
+
+    __tablename__ = "auth_tokens"
+
+    token_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("auth_users.user_id", ondelete="CASCADE"),
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(128))          # human label
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    hash_prefix: Mapped[str] = mapped_column(String(8))     # first 8 hex of hash, for UI fingerprint
+    role: Mapped[str] = mapped_column(String(16), default="admin", server_default="admin")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AuthSession(Base):
+    """Web-login session. Opaque ``session_id`` lives in the cookie.
+
+    No TTL — session stays valid until either (a) the user logs out, or
+    (b) their password is changed (all *other* sessions get revoked) or
+    (c) an admin explicitly revokes via /sessions/{id}.
+    """
+
+    __tablename__ = "auth_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("auth_users.user_id", ondelete="CASCADE"),
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 # ---------------------------------------------------------------------------

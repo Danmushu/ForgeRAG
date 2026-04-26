@@ -5,6 +5,10 @@
  * FileGrid/List, MillerColumn, ContextMenu, ...) receive this via
  * props / provide-inject so they can share selection + current path
  * state without each owning their own.
+ *
+ * State is preserved across navigations because Workspace.vue is wrapped
+ * in <KeepAlive> in App.vue — the component isn't unmounted when the user
+ * navigates away.
  */
 
 import { computed, reactive, ref } from 'vue'
@@ -34,12 +38,12 @@ export function useWorkspace() {
   const childDocuments = ref([])  // list of DocumentOut
   const contentsLoading = ref(false)
 
-  // ── View mode: 'grid' | 'list' | 'miller' ──────────────────────────
-  const viewMode = ref(
-    localStorage.getItem('workspace.viewMode') || 'grid',
-  )
+  // ── View mode: 'grid' | 'list' ─────────────────────────────────────
+  // Default = grid (the 2D tile view). The legacy 'miller' mode was dropped.
+  const _savedMode = localStorage.getItem('workspace.viewMode')
+  const viewMode = ref(['grid', 'list'].includes(_savedMode) ? _savedMode : 'grid')
   function setViewMode(mode) {
-    if (!['grid', 'list', 'miller'].includes(mode)) return
+    if (!['grid', 'list'].includes(mode)) return
     viewMode.value = mode
     localStorage.setItem('workspace.viewMode', mode)
   }
@@ -81,10 +85,12 @@ export function useWorkspace() {
   const hasClipboard = computed(() => clipboard.op && clipboard.items.length > 0)
 
   // ── Breadcrumbs ───────────────────────────────────────────────────
+  // First segment is the literal "/" (the workspace root), not a "Home"
+  // label — matches how paths are stored everywhere else.
   const breadcrumbs = computed(() => {
-    if (currentPath.value === ROOT_PATH) return [{ name: 'Home', path: '/' }]
+    if (currentPath.value === ROOT_PATH) return [{ name: '/', path: '/' }]
     const parts = currentPath.value.split('/').filter(Boolean)
-    const crumbs = [{ name: 'Home', path: '/' }]
+    const crumbs = [{ name: '/', path: '/' }]
     let acc = ''
     parts.forEach(p => {
       acc += '/' + p
@@ -95,13 +101,16 @@ export function useWorkspace() {
 
   // ── Loaders ───────────────────────────────────────────────────────
 
+  const treeError = ref(null)
   async function loadTree(depth = 4) {
     treeLoading.value = true
+    treeError.value = null
     try {
       tree.value = await getFolderTree('/', depth, false)
     } catch (e) {
       console.error('loadTree failed:', e)
       tree.value = null
+      treeError.value = e?.message || String(e)
     } finally {
       treeLoading.value = false
     }
@@ -110,24 +119,18 @@ export function useWorkspace() {
   async function loadContents(path = currentPath.value) {
     contentsLoading.value = true
     try {
-      // Fetch folder tree at depth=1 to get direct children
+      // Child folders via the tree endpoint (depth=1 = direct children)
       const node = await getFolderTree(path, 1, false)
       childFolders.value = (node?.children || []).filter(c => !c.is_system || c.path === path)
-      // Fetch documents under this path (prefix search via list endpoint)
-      // Listing with path_prefix isn't a current backend feature, so we
-      // request a generous page and filter client-side. OK for < 1000 docs.
-      const docs = await listDocuments({ limit: 500, offset: 0 })
-      const items = docs?.items || []
-      const norm = path === '/' ? '' : path
-      childDocuments.value = items.filter(d => {
-        if (!d.path) return false
-        // Exact children of the current folder: path starts with "<norm>/"
-        // AND no further "/" after that
-        const head = norm ? norm + '/' : '/'
-        if (!d.path.startsWith(head)) return false
-        const tail = d.path.slice(head.length)
-        return tail.length > 0 && !tail.includes('/')
+      // Direct-child documents via server-side path_filter — paginated,
+      // no more "pull 500 and filter client-side" hack.
+      const docs = await listDocuments({
+        path_filter: path,
+        recursive: false,
+        limit: 200,
+        offset: 0,
       })
+      childDocuments.value = docs?.items || []
     } catch (e) {
       console.error('loadContents failed:', e)
       childFolders.value = []
@@ -137,7 +140,10 @@ export function useWorkspace() {
     }
   }
 
-  async function navigate(path) {
+  async function navigate(path, { force = false } = {}) {
+    // Dedup: clicking the already-active folder shouldn't re-fetch unless
+    // the caller asks for a refresh (e.g. post-upload).
+    if (!force && path === currentPath.value && !contentsLoading.value) return
     currentPath.value = path
     clearSelection()
     await loadContents(path)
@@ -184,7 +190,7 @@ export function useWorkspace() {
   return {
     // state
     currentPath,
-    tree, treeLoading,
+    tree, treeLoading, treeError,
     childFolders, childDocuments, contentsLoading,
     viewMode, setViewMode,
     selection, isSelected, toggleSelect, selectAll, clearSelection,

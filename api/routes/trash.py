@@ -14,7 +14,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from persistence.permissions import Permission, PermissionService
+from persistence.scope import ScopeMode, ScopeService
 from persistence.trash_service import TrashService
 
 from ..deps import get_state
@@ -45,9 +45,9 @@ class PurgeItemsReq(BaseModel):
 
 @router.get("")
 def list_trash(state: AppState = Depends(get_state)):
-    perm = PermissionService(state.store)
-    # Viewing trash requires at least view on root
-    perm.require_folder("__root__", Permission.VIEW)
+    scope = ScopeService(state.store)
+    # Listing trash requires the root folder to be in READ scope
+    scope.require_folder("__root__", ScopeMode.READ)
     svc = TrashService(state)
     return svc.list()
 
@@ -75,8 +75,8 @@ def trash_stats(state: AppState = Depends(get_state)):
 
 @router.post("/restore")
 def restore_items(body: RestoreReq, state: AppState = Depends(get_state)):
-    perm = PermissionService(state.store)
-    perm.require_folder("__root__", Permission.EDIT)
+    scope = ScopeService(state.store)
+    scope.require_folder("__root__", ScopeMode.WRITE)
     svc = TrashService(state)
     result = svc.restore(doc_ids=body.doc_ids, folder_paths=body.folder_paths)
     return result
@@ -84,8 +84,8 @@ def restore_items(body: RestoreReq, state: AppState = Depends(get_state)):
 
 @router.delete("/items")
 def purge_items(body: PurgeItemsReq, state: AppState = Depends(get_state)):
-    perm = PermissionService(state.store)
-    perm.require_folder("__root__", Permission.ADMIN)
+    scope = ScopeService(state.store)
+    scope.require_folder("__root__", ScopeMode.MANAGE)
     svc = TrashService(state)
     if not body.doc_ids and not body.folder_paths:
         raise HTTPException(400, "specify at least one doc_id or folder_path")
@@ -94,7 +94,7 @@ def purge_items(body: PurgeItemsReq, state: AppState = Depends(get_state)):
 
 @router.delete("")
 def empty_trash(state: AppState = Depends(get_state)):
-    perm = PermissionService(state.store)
-    perm.require_folder("__root__", Permission.ADMIN)
+    scope = ScopeService(state.store)
+    scope.require_folder("__root__", ScopeMode.MANAGE)
     svc = TrashService(state)
     return svc.empty()

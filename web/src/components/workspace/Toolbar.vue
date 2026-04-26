@@ -1,5 +1,5 @@
 <template>
-  <div class="flex items-center gap-1 px-3 py-1.5 border-b border-line bg-bg">
+  <div class="flex items-center gap-1 px-3 py-1.5 border-b border-line bg-bg2">
     <!-- Primary actions — everything else lives in the context menu -->
     <button class="toolbar-btn" @click="$emit('new-folder')" title="New folder (Ctrl+N)">
       ⊕ <span>New</span>
@@ -10,8 +10,25 @@
 
     <div class="flex-1"></div>
 
+    <!-- Search — filters the current folder's children -->
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input
+        :value="search"
+        @input="$emit('update:search', $event.target.value)"
+        placeholder="Search this folder…"
+        class="search-input"
+      />
+      <button
+        v-if="search"
+        class="search-clear"
+        @click="$emit('update:search', '')"
+        title="Clear"
+      >✕</button>
+    </div>
+
     <!-- View mode switcher -->
-    <div class="flex items-center gap-0.5 p-0.5 border border-line rounded-md">
+    <div class="flex items-center gap-0.5 p-0.5 border border-line rounded-md ml-2">
       <button
         class="view-btn"
         :class="{ 'view-btn--active': viewMode === 'grid' }"
@@ -24,12 +41,6 @@
         @click="$emit('set-view', 'list')"
         title="List view (Ctrl+2)"
       >☰</button>
-      <button
-        class="view-btn"
-        :class="{ 'view-btn--active': viewMode === 'miller' }"
-        @click="$emit('set-view', 'miller')"
-        title="Miller columns (Ctrl+3)"
-      >▦</button>
     </div>
 
     <!-- Trash shortcut -->
@@ -47,8 +58,9 @@
 defineProps({
   viewMode: { type: String, required: true },
   trashCount: { type: Number, default: 0 },
+  search: { type: String, default: '' },
 })
-defineEmits(['new-folder', 'upload', 'set-view', 'show-trash'])
+defineEmits(['new-folder', 'upload', 'set-view', 'show-trash', 'update:search'])
 </script>
 
 <style scoped>
@@ -86,4 +98,50 @@ defineEmits(['new-folder', 'upload', 'set-view', 'show-trash'])
 }
 .view-btn:hover { color: var(--color-t1); background: var(--color-bg2); }
 .view-btn--active { background: var(--color-bg3); color: var(--color-t1); }
+
+/* Search field — inline icon + clear button */
+.search-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 240px;
+}
+.search-icon {
+  position: absolute;
+  left: 8px;
+  font-size: 12px;
+  color: var(--color-t3);
+  pointer-events: none;
+  line-height: 1;
+}
+.search-input {
+  width: 100%;
+  padding: 5px 26px 5px 24px;
+  font-size: 11px;
+  color: var(--color-t1);
+  background: var(--color-bg);
+  border: 1px solid var(--color-line);
+  border-radius: var(--r-sm);
+  outline: none;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.search-input:hover { border-color: var(--color-line2); }
+.search-input:focus { border-color: var(--color-line2); box-shadow: var(--ring-focus); }
+.search-input::placeholder { color: var(--color-t3); }
+.search-clear {
+  position: absolute;
+  right: 4px;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: var(--color-t3);
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.search-clear:hover { background: var(--color-bg2); color: var(--color-t1); }
 </style>

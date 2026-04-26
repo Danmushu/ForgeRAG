@@ -133,7 +133,7 @@ onUnmounted(() => stopPolling())
 </script>
 
 <template>
-  <div ref="scrollEl" class="h-full overflow-y-auto scroll-smooth bg-bg">
+  <div ref="scrollEl" class="h-full overflow-y-auto scroll-smooth bg-bg2">
 
     <!-- ═══ Intro section — fills first screen ═══ -->
     <div class="min-h-full flex flex-col justify-center px-10 py-16">

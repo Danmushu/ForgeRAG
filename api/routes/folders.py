@@ -12,8 +12,9 @@ Endpoints:
 
 All mutations flow through FolderService, which is the single
 transactional boundary keeping folder_id / path / path_lower in sync.
-Permission checks go through PermissionService.require_folder (currently
-always-allow).
+Scope checks go through ScopeService.require_folder (always-allow in
+single-tenant mode; the hooks are reserved for future read-only /
+archive-lock flags — not ACL).
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from persistence.folder_service import (
     FolderService,
     InvalidFolderName,
 )
-from persistence.permissions import Permission, PermissionService
+from persistence.scope import ScopeMode, ScopeService
 
 from ..deps import get_state
 from ..state import AppState
@@ -173,14 +174,14 @@ def folder_info(
 
 @router.post("", response_model=FolderOut, status_code=201)
 def create_folder(body: CreateFolderReq, state: AppState = Depends(get_state)):
-    perm = PermissionService(state.store)
+    scope = ScopeService(state.store)
     with state.store.transaction() as sess:
         svc = FolderService(sess)
         try:
             parent = svc.require_by_path(body.parent_path)
         except FolderNotFound:
             raise HTTPException(404, f"parent folder not found: {body.parent_path!r}")
-        perm.require_folder(parent.folder_id, Permission.EDIT)
+        scope.require_folder(parent.folder_id, ScopeMode.WRITE)
         try:
             new = svc.create(body.parent_path, body.name)
         except InvalidFolderName as e:
@@ -218,7 +219,7 @@ def _apply_post_commit_cross_store(
 
 @router.patch("/rename", response_model=FolderOut)
 def rename_folder(body: RenameFolderReq, state: AppState = Depends(get_state)):
-    perm = PermissionService(state.store)
+    scope = ScopeService(state.store)
     pending_ops: list[dict] = []
     with state.store.transaction() as sess:
         svc = FolderService(sess)
@@ -226,7 +227,7 @@ def rename_folder(body: RenameFolderReq, state: AppState = Depends(get_state)):
             folder = svc.require_by_path(body.path)
         except FolderNotFound:
             raise HTTPException(404, f"folder not found: {body.path!r}")
-        perm.require_folder(folder.folder_id, Permission.EDIT)
+        scope.require_folder(folder.folder_id, ScopeMode.WRITE)
         try:
             updated = svc.rename(folder.folder_id, body.new_name)
         except InvalidFolderName as e:
@@ -246,7 +247,7 @@ def rename_folder(body: RenameFolderReq, state: AppState = Depends(get_state)):
 
 @router.post("/move", response_model=FolderOut)
 def move_folder(body: MoveFolderReq, state: AppState = Depends(get_state)):
-    perm = PermissionService(state.store)
+    scope = ScopeService(state.store)
     pending_ops: list[dict] = []
     with state.store.transaction() as sess:
         svc = FolderService(sess)
@@ -255,8 +256,8 @@ def move_folder(body: MoveFolderReq, state: AppState = Depends(get_state)):
             new_parent = svc.require_by_path(body.to_parent_path)
         except FolderNotFound as e:
             raise HTTPException(404, str(e))
-        perm.require_folder(folder.folder_id, Permission.EDIT)
-        perm.require_folder(new_parent.folder_id, Permission.EDIT)
+        scope.require_folder(folder.folder_id, ScopeMode.WRITE)
+        scope.require_folder(new_parent.folder_id, ScopeMode.WRITE)
         try:
             updated = svc.move(folder.folder_id, body.to_parent_path)
         except FolderAlreadyExists as e:
@@ -277,7 +278,7 @@ def delete_folder(
     state: AppState = Depends(get_state),
 ):
     """Soft-delete: move the folder (and its whole subtree) into /__trash__."""
-    perm = PermissionService(state.store)
+    scope = ScopeService(state.store)
     pending_ops: list[dict] = []
     with state.store.transaction() as sess:
         svc = FolderService(sess)
@@ -285,7 +286,7 @@ def delete_folder(
             folder = svc.require_by_path(path)
         except FolderNotFound:
             raise HTTPException(404, f"folder not found: {path!r}")
-        perm.require_folder(folder.folder_id, Permission.ADMIN)
+        scope.require_folder(folder.folder_id, ScopeMode.MANAGE)
         try:
             trashed = svc.move_to_trash(folder.folder_id)
         except FolderIsSystemProtected as e:

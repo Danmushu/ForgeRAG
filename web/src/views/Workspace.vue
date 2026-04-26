@@ -1,11 +1,45 @@
 <template>
-  <div class="workspace" @keydown="onKeydown" tabindex="0">
+  <div
+    class="workspace"
+    :class="{ 'workspace--drag-over': osDragActive }"
+    @keydown="onKeydown"
+    @click="onWorkspaceClick"
+    @dragenter.prevent="onOSDragEnter"
+    @dragover.prevent="onOSDragOver"
+    @dragleave="onOSDragLeave"
+    @drop.prevent="onOSDrop"
+    tabindex="0"
+  >
+    <!-- Drag-over overlay — full viewport drop zone hint (only visible when
+         the user is dragging FILES from the OS, not internal folder/doc
+         drags which already have their own per-folder drop targets). -->
+    <div v-if="osDragActive" class="workspace__drop-overlay">
+      <div class="drop-pill">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+        </svg>
+        <span>Drop files to upload to <code>{{ ws.currentPath.value }}</code></span>
+      </div>
+    </div>
+    <!-- Doc detail overlay (PDF + tree + chunks) — takes over when ?doc=X -->
+    <div v-if="focusedDocId" class="workspace__doc-detail">
+      <Repository
+        :inline="true"
+        :initial-doc-id="focusedDocId"
+        @close="onDocDetailClose"
+      />
+    </div>
+
+    <!-- Browser mode (default) -->
+    <template v-else>
     <!-- Top bar: breadcrumb + toolbar -->
     <div class="workspace__top">
       <Breadcrumb :crumbs="ws.breadcrumbs.value" @navigate="navigate" />
       <Toolbar
         :view-mode="ws.viewMode.value"
         :trash-count="trashCount"
+        v-model:search="searchQuery"
         @new-folder="onNewFolder"
         @upload="onUpload"
         @set-view="ws.setViewMode"
@@ -20,8 +54,11 @@
         <FolderTree
           :root="ws.tree.value"
           :current-path="ws.currentPath.value"
+          :loading="ws.treeLoading.value"
+          :error="ws.treeError.value"
           @navigate="navigate"
           @drop-into="onSidebarDrop"
+          @retry="ws.loadTree()"
         />
       </aside>
 
@@ -37,40 +74,41 @@
         />
 
         <template v-else>
-          <MillerColumn
-            v-if="ws.viewMode.value === 'miller'"
-            :initial-path="ws.currentPath.value"
-            @navigate="navigate"
-            @open-folder="navigate"
-            @open-document="onOpenDocument"
-            @context-menu="openContextMenu"
-          />
-          <MarqueeSelection v-else @select="onMarqueeSelect">
+          <MarqueeSelection @select="onMarqueeSelect">
             <FileGrid
               v-if="ws.viewMode.value === 'grid'"
-              :folders="ws.childFolders.value"
-              :documents="ws.childDocuments.value"
+              :folders="filteredFolders"
+              :documents="filteredDocuments"
+              :loading="ws.contentsLoading.value"
               :selection="ws.selection"
+              :creating="creatingFolder"
               @select="({ key, additive }) => ws.toggleSelect(key, { additive })"
               @open-folder="navigate"
               @open-document="onOpenDocument"
               @context-menu="openContextMenu"
               @drop-onto-folder="onDropOntoFolder"
+              @confirm-create="onCreateFolderInline"
+              @cancel-create="creatingFolder = false"
             />
             <FileList
               v-else
-              :folders="ws.childFolders.value"
-              :documents="ws.childDocuments.value"
+              :folders="filteredFolders"
+              :documents="filteredDocuments"
+              :loading="ws.contentsLoading.value"
               :selection="ws.selection"
+              :creating="creatingFolder"
               @select="({ key, additive }) => ws.toggleSelect(key, { additive })"
               @open-folder="navigate"
               @open-document="onOpenDocument"
               @context-menu="openContextMenu"
+              @confirm-create="onCreateFolderInline"
+              @cancel-create="creatingFolder = false"
             />
           </MarqueeSelection>
         </template>
       </main>
     </div>
+    </template>
 
     <!-- Context menu -->
     <ContextMenu
@@ -95,21 +133,121 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
-import { getTrashStats, uploadAndIngest } from '@/api'
+import { useRouter, useRoute } from 'vue-router'
+import { getTrashStats } from '@/api'
 import { useWorkspace } from '@/composables/useWorkspace'
+import { useUploadsStore } from '@/stores/uploads'
+import { useDialog } from '@/composables/useDialog'
+import Repository from '@/views/Repository.vue'
 import Breadcrumb from '@/components/workspace/Breadcrumb.vue'
 import Toolbar from '@/components/workspace/Toolbar.vue'
 import FolderTree from '@/components/workspace/FolderTree.vue'
 import FileGrid from '@/components/workspace/FileGrid.vue'
 import FileList from '@/components/workspace/FileList.vue'
-import MillerColumn from '@/components/workspace/MillerColumn.vue'
 import ContextMenu from '@/components/workspace/ContextMenu.vue'
 import MarqueeSelection from '@/components/workspace/MarqueeSelection.vue'
 import TrashView from '@/components/workspace/TrashView.vue'
 
 const router = useRouter()
+const route = useRoute()
 const ws = useWorkspace()
+const { confirm, toast } = useDialog()
+
+// ── OS drag-and-drop file upload ─────────────────────────────────
+// Counter pattern: dragenter/leave fire for every child element nested
+// inside the workspace. Naive listening drops the overlay every time
+// the cursor crosses an interior border. We count pos/neg events.
+const osDragActive = ref(false)
+let _dragCounter = 0
+
+function isOSFileDrag(e) {
+  // dataTransfer.types is a TokenList-ish — has 'Files' for OS drags,
+  // 'application/x-forgerag-item' for our internal folder/doc drags.
+  const types = e.dataTransfer?.types
+  if (!types) return false
+  return Array.from(types).includes('Files')
+}
+
+function onOSDragEnter(e) {
+  if (!isOSFileDrag(e)) return
+  _dragCounter++
+  osDragActive.value = true
+}
+
+function onOSDragOver(e) {
+  if (!isOSFileDrag(e)) return
+  e.dataTransfer.dropEffect = 'copy'
+}
+
+function onOSDragLeave(e) {
+  if (!isOSFileDrag(e)) return
+  _dragCounter--
+  if (_dragCounter <= 0) {
+    _dragCounter = 0
+    osDragActive.value = false
+  }
+}
+
+function onOSDrop(e) {
+  if (!isOSFileDrag(e)) return
+  _dragCounter = 0
+  osDragActive.value = false
+  const files = Array.from(e.dataTransfer.files || [])
+  if (!files.length) return
+  // Hand off to the global upload queue (same path as the toolbar Upload btn)
+  uploads.enqueue(files, { folderPath: ws.currentPath.value })
+  uploads.toggleDrawer(true)
+  // Refresh the file list shortly after so newly-ingested docs surface
+  setTimeout(() => { refresh() }, 800)
+}
+
+// ── Click-empty-area to clear selection ───────────────────────────
+// Cards/items use @click.stop so their clicks never reach this handler.
+// Anything else (workspace background, file-grid empty space) clears.
+function onWorkspaceClick(e) {
+  // Skip if clicking inside the toolbar / breadcrumb / sidebar — only
+  // clear when clicking in the file-list area or the surrounding shell.
+  const t = e.target
+  if (t.closest('.workspace__top') || t.closest('.workspace__sidebar')) return
+  // Skip if a context menu was just dismissed via this click (handled elsewhere)
+  if (ctx.open) return
+  if (ws.selection.size > 0) ws.clearSelection()
+}
+
+// ── Toolbar search + inline new-folder state ─────────────────────
+const searchQuery = ref('')
+const creatingFolder = ref(false)
+
+// Case-insensitive filter on folder name + document filename. Fallback to
+// the full list when search is empty so we avoid re-allocating arrays.
+const filteredFolders = computed(() => {
+  const q = searchQuery.value.trim().toLowerCase()
+  if (!q) return ws.childFolders.value
+  return ws.childFolders.value.filter((f) => (f.name || '').toLowerCase().includes(q))
+})
+const filteredDocuments = computed(() => {
+  const q = searchQuery.value.trim().toLowerCase()
+  if (!q) return ws.childDocuments.value
+  return ws.childDocuments.value.filter((d) =>
+    (d.filename || d.file_name || '').toLowerCase().includes(q),
+  )
+})
+const uploads = useUploadsStore()
+
+// URL-driven doc detail. Clicking a document in the browser sets ?doc=<id>
+// which swaps the main area for the embedded Repository view (PDF + tree +
+// chunks). Clearing the query returns to the browser.
+const focusedDocId = computed(() => {
+  const d = route.query.doc
+  return typeof d === 'string' && d ? d : ''
+})
+
+function onDocDetailClose() {
+  const q = { ...route.query }
+  // Clear the doc + its side-state (tab, pipeline, node, chunk, pdf)
+  delete q.doc; delete q.pipeline; delete q.node; delete q.chunk; delete q.pdf
+  router.replace({ path: route.path, query: q })
+}
 
 // ── Page state ────────────────────────────────────────────────────
 const viewingTrash = ref(false)
@@ -217,13 +355,23 @@ function onExitTrash() {
   refresh()
 }
 
-async function onNewFolder() {
-  const name = window.prompt('New folder name:')
+function onNewFolder() {
+  // Windows-style: surface an inline editable folder row in the current
+  // view, autofocus its name input. The actual create happens once the
+  // user confirms (Enter / blur with text).
+  creatingFolder.value = true
+}
+
+async function onCreateFolderInline(rawName) {
+  const name = (rawName || '').trim()
+  // Always exit the creating mode — even on empty input, otherwise the
+  // ghost row sticks around.
+  creatingFolder.value = false
   if (!name) return
   try {
-    await ws.opCreateFolder(ws.currentPath.value, name.trim())
+    await ws.opCreateFolder(ws.currentPath.value, name)
   } catch (e) {
-    alert('Create failed: ' + e.message)
+    toast('Create failed: ' + e.message, { variant: 'error' })
   }
 }
 
@@ -231,18 +379,18 @@ function onUpload() {
   fileInput.value?.click()
 }
 
-async function onFilesPicked(e) {
+function onFilesPicked(e) {
   const files = [...(e.target.files || [])]
   if (!files.length) return
-  for (const f of files) {
-    try {
-      await uploadAndIngest(f)
-    } catch (err) {
-      console.error('upload failed:', err)
-    }
-  }
+  const folderPath = ws.currentPath.value
+  // Hand files off to the global upload queue — it handles upload + ingestion
+  // polling + progress UI. Open the drawer so the user sees activity start.
+  uploads.enqueue(files, { folderPath })
+  uploads.toggleDrawer(true)
   e.target.value = ''
-  await refresh()
+  // Kick a workspace refresh after a short delay so new docs appear in the
+  // file tree once they hit the DB. The queue keeps updating independently.
+  setTimeout(() => { refresh() }, 800)
 }
 
 async function onRenameFolder(item) {
@@ -251,7 +399,7 @@ async function onRenameFolder(item) {
   try {
     await ws.opRenameFolder(item.path, newName.trim())
   } catch (e) {
-    alert('Rename failed: ' + e.message)
+    toast('Rename failed: ' + e.message, { variant: 'error' })
   }
 }
 
@@ -262,26 +410,37 @@ async function onMoveDialog(item) {
     if (item.type === 'folder') await ws.opMoveFolder(item.path, target)
     else await ws.opMoveDocument(item.doc_id, target)
   } catch (e) {
-    alert('Move failed: ' + e.message)
+    toast('Move failed: ' + e.message, { variant: 'error' })
   }
 }
 
 async function onDelete(item) {
   const name = item.name
-  if (!confirm(`Move "${name}" to the recycle bin?`)) return
+  if (item.type === 'folder') {
+    const ok = await confirm({
+      title: `Move "${name}" to recycle bin?`,
+      description: 'Items in the recycle bin can be restored later.',
+      confirmText: 'Move to bin',
+    })
+    if (!ok) return
+    try { await ws.opDeleteFolder(item.path) }
+    catch (e) { toast('Delete failed: ' + e.message, { variant: 'error' }) }
+    return
+  }
+  // Documents: hard-delete (no soft-delete for individual docs yet).
+  const ok = await confirm({
+    title: `Permanently delete "${name}"?`,
+    description: 'This document will be deleted with no recycle bin. Cannot be undone.',
+    confirmText: 'Delete forever',
+    variant: 'destructive',
+  })
+  if (!ok) return
   try {
-    if (item.type === 'folder') await ws.opDeleteFolder(item.path)
-    else {
-      // Documents use the existing DELETE /documents endpoint which does hard-delete.
-      // For Phase 1, we don't wire soft-delete for individual docs (folders cover
-      // most real-world use). Show a clearer message.
-      if (!confirm('Deleting a single document is permanent (no recycle bin yet). Continue?')) return
-      const { request } = await import('@/api/client')
-      await request(`/api/v1/documents/${item.doc_id}`, { method: 'DELETE' })
-      await refresh()
-    }
+    const { request } = await import('@/api/client')
+    await request(`/api/v1/documents/${item.doc_id}`, { method: 'DELETE' })
+    await refresh()
   } catch (e) {
-    alert('Delete failed: ' + e.message)
+    toast('Delete failed: ' + e.message, { variant: 'error' })
   }
 }
 
@@ -331,7 +490,7 @@ async function onPaste() {
     }
     ws.clearClipboard()
   } catch (e) {
-    alert('Paste failed: ' + e.message)
+    toast('Paste failed: ' + e.message, { variant: 'error' })
   }
 }
 
@@ -348,7 +507,7 @@ async function doDropMove(items, targetPath) {
       if (i.type === 'folder') await ws.opMoveFolder(i.path, targetPath)
     }
   } catch (e) {
-    alert('Move failed: ' + e.message)
+    toast('Move failed: ' + e.message, { variant: 'error' })
   }
 }
 
@@ -362,9 +521,7 @@ function scopeChatTo(path) {
 }
 
 function onOpenDocument(doc) {
-  // For Phase 1: open the document's repository view (existing UI),
-  // or navigate to /repository?doc=X. Simplest: open PDF viewer route.
-  router.push(`/repository?doc=${doc.doc_id}`)
+  router.push({ path: '/workspace', query: { doc: doc.doc_id } })
 }
 
 // ── Keyboard shortcuts ─────────────────────────────────────────────
@@ -388,7 +545,6 @@ function onKeydown(e) {
     onPaste()
   } else if (mod && e.key === '1') { ws.setViewMode('grid') }
     else if (mod && e.key === '2') { ws.setViewMode('list') }
-    else if (mod && e.key === '3') { ws.setViewMode('miller') }
   else if (mod && e.key.toLowerCase() === 'a') {
     e.preventDefault()
     const all = [
@@ -421,11 +577,50 @@ onMounted(async () => {
 
 <style scoped>
 .workspace {
+  position: relative;          /* anchor for the drop overlay */
   display: flex;
   flex-direction: column;
   height: 100%;
   min-height: 0;
   outline: none;
+}
+
+/* Whole-workspace drop hint when user drags FILES from the OS */
+.workspace__drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;        /* events still reach drop targets below */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--color-bg2) 70%, transparent);
+  backdrop-filter: blur(2px);
+  border: 2px dashed var(--color-line2);
+  border-radius: var(--r-md);
+}
+.drop-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  font-size: 12px;
+  color: var(--color-t1);
+  background: var(--color-bg);
+  border: 1px solid var(--color-line);
+  border-radius: var(--r-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+.drop-pill code {
+  font-size: 11px;
+  color: var(--color-t2);
+  padding: 1px 5px;
+  background: var(--color-bg2);
+  border-radius: var(--r-sm);
+}
+/* Slight tinted-border pulse when actively over the area */
+.workspace--drag-over .workspace__drop-overlay {
+  border-color: var(--color-t2);
 }
 .workspace__top {
   display: flex;
@@ -446,7 +641,7 @@ onMounted(async () => {
   flex-shrink: 0;
   border-right: 1px solid var(--color-line);
   overflow-y: auto;
-  background: var(--color-bg);
+  background: var(--color-bg2);   /* canvas — matches outer body */
 }
 .workspace__main {
   flex: 1;
@@ -456,4 +651,16 @@ onMounted(async () => {
   flex-direction: column;
 }
 .hidden { display: none; }
+
+/* Inline doc detail — takes the full Workspace area */
+.workspace__doc-detail {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.workspace__doc-detail > :deep(*) {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
 </style>

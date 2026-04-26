@@ -15,8 +15,8 @@
         @click.stop="$emit('toggle', node.path)"
       >{{ isExpanded ? '▾' : '▸' }}</span>
       <span class="tree-icon">📁</span>
-      <span class="truncate">{{ node.name || 'Root' }}</span>
-      <span v-if="node.document_count" class="tree-count">{{ node.document_count }}</span>
+      <span class="tree-label">{{ node.name || 'Root' }}</span>
+      <span v-if="badgeCount > 0" class="tree-count">{{ badgeCount }}</span>
     </div>
     <div v-if="isExpanded && hasChildren">
       <FolderTreeNode
@@ -46,15 +46,32 @@ const props = defineProps({
 const emit = defineEmits(['toggle', 'click-folder', 'drop-into'])
 
 const isExpanded = computed(() => props.expanded.has(props.node.path))
-const hasChildren = computed(() => (props.node.children || []).length > 0)
-const visibleChildren = computed(() => {
+// Guard: children may be undefined / null / non-array from a malformed response
+const safeChildren = computed(() => {
+  const c = props.node?.children
+  return Array.isArray(c) ? c : []
+})
+const hasChildren = computed(() => safeChildren.value.length > 0)
+const visibleChildren = computed(
   // Hide system folders from sidebar navigation (trash is accessed separately)
-  return (props.node.children || []).filter(c => !c.is_system)
+  () => safeChildren.value.filter(c => !c.is_system),
+)
+// Coerce document_count to a non-negative integer; some backends may omit it
+const badgeCount = computed(() => {
+  const n = Number(props.node?.document_count)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
 })
 
 const isDragOver = ref(false)
 
-function onClick() { emit('click-folder', props.node.path) }
+function onClick() {
+  // If clicking a collapsed parent, expand it so the user sees context;
+  // clicking the already-active folder is handled upstream (navigate dedupes).
+  if (hasChildren.value && !isExpanded.value) {
+    emit('toggle', props.node.path)
+  }
+  emit('click-folder', props.node.path)
+}
 
 function onDragOver(e) {
   // Accept file-manager items (JSON payload with type+path)
@@ -70,7 +87,12 @@ function onDrop(e) {
   if (!raw) return
   let items
   try { items = JSON.parse(raw) } catch { return }
-  emit('drop-into', { items, targetPath: props.node.path })
+  // Reject the obvious self-drop; the server catches subtree-into-self too
+  // but we save a round-trip for the most common mistake.
+  const targetPath = props.node.path
+  const payload = Array.isArray(items?.items) ? items.items : []
+  if (payload.some(it => it?.type === 'folder' && it?.path === targetPath)) return
+  emit('drop-into', { items, targetPath })
 }
 </script>
 
@@ -97,6 +119,13 @@ function onDrop(e) {
   flex-shrink: 0;
 }
 .tree-icon { flex-shrink: 0; }
+.tree-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .tree-count {
   margin-left: auto;
   font-size: 9px;

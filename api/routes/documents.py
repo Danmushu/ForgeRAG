@@ -109,6 +109,11 @@ def ingest_document(
     from pathlib import Path as _Path
 
     from ingestion.queue import IngestionJob
+    from persistence.folder_service import (
+        FolderNotFound,
+        FolderService,
+        unique_document_path,
+    )
 
     # Validate file exists
     file_row = state.store.get_file(req.file_id)
@@ -119,27 +124,28 @@ def ingest_document(
     name = file_row.get("display_name", "upload.bin")
     ext = _Path(name).suffix.lower().lstrip(".")
     fmt = {
-        "pdf": "pdf",
-        "docx": "docx",
-        "doc": "docx",
-        "pptx": "pptx",
-        "ppt": "pptx",
-        "xlsx": "xlsx",
-        "xls": "xlsx",
-        "txt": "text",
-        "md": "text",
-        "html": "html",
-        "htm": "html",
+        "pdf": "pdf", "docx": "docx", "doc": "docx",
+        "pptx": "pptx", "ppt": "pptx", "xlsx": "xlsx", "xls": "xlsx",
+        "txt": "text", "md": "text", "html": "html", "htm": "html",
     }.get(ext, ext or "unknown")
 
     # Create placeholder (if not force_reparse with existing doc)
     if not req.force_reparse:
+        folder_path = req.folder_path or "/"
+        with state.store.transaction() as sess:
+            try:
+                folder = FolderService(sess).require_by_path(folder_path)
+            except FolderNotFound:
+                raise HTTPException(404, f"folder not found: {folder_path!r}")
+            doc_path = unique_document_path(sess, folder, name)
         state.store.create_document_placeholder(
             doc_id=doc_id,
             file_id=req.file_id,
-            filename=name,
+            filename=_Path(doc_path).name,  # keep suffix from collision (e.g. 'foo (1).pdf')
             format=fmt,
             status="pending",
+            folder_id=folder.folder_id,
+            path=doc_path,
         )
     else:
         state.store.update_document_status(doc_id, status="pending")
@@ -167,66 +173,71 @@ async def upload_and_ingest(
     original_name: str | None = Form(None),
     mime_type: str | None = Form(None),
     doc_id: str | None = Form(None),
+    folder_path: str | None = Form(
+        None,
+        description="Destination folder, e.g. '/legal/2024'. Default = '/'.",
+    ),
     state: AppState = Depends(get_state),
 ):
     """
-    Upload a file and queue it for background ingestion.
-    Returns 202 Accepted immediately — the document appears in the
-    list with status='pending' and transitions through
-    processing → parsing → parsed → ready (or error).
+    Upload a file and queue it for background ingestion. Returns 202 —
+    the document appears in listings with status='pending' and transitions
+    through processing → parsing → parsed → ready (or error).
+
+    The new document lives under ``folder_path`` (defaults to root). If a
+    sibling with the same name exists the filename is auto-suffixed
+    (``foo.pdf`` → ``foo (1).pdf``).
     """
     from pathlib import Path as _Path
 
     from ingestion.queue import IngestionJob
+    from persistence.folder_service import (
+        FolderNotFound,
+        FolderService,
+        unique_document_path,
+    )
 
     name = original_name or file.filename or "upload.bin"
     mime = mime_type or file.content_type
     data = await file.read()
 
+    # Resolve destination folder BEFORE doing the upload so a bad path
+    # returns 404 without orphaning a blob.
+    target_folder_path = folder_path or "/"
+    with state.store.transaction() as sess:
+        try:
+            folder = FolderService(sess).require_by_path(target_folder_path)
+        except FolderNotFound:
+            raise HTTPException(404, f"folder not found: {target_folder_path!r}")
+        target_folder_id = folder.folder_id
+        doc_path = unique_document_path(sess, folder, name)
+
     # Phase A: upload file (fast, synchronous)
     try:
-        file_id = state.ingestion.upload(
-            data,
-            original_name=name,
-            mime_type=mime,
-        )
+        file_id = state.ingestion.upload(data, original_name=name, mime_type=mime)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    # Derive doc_id
     actual_doc_id = doc_id or f"doc_{file_id[:12]}"
 
-    # Detect format from extension
     ext = _Path(name).suffix.lower().lstrip(".")
     fmt = {
-        "pdf": "pdf",
-        "docx": "docx",
-        "doc": "docx",
-        "pptx": "pptx",
-        "ppt": "pptx",
-        "xlsx": "xlsx",
-        "xls": "xlsx",
-        "txt": "text",
-        "md": "text",
-        "html": "html",
-        "htm": "html",
+        "pdf": "pdf", "docx": "docx", "doc": "docx",
+        "pptx": "pptx", "ppt": "pptx", "xlsx": "xlsx", "xls": "xlsx",
+        "txt": "text", "md": "text", "html": "html", "htm": "html",
     }.get(ext, ext or "unknown")
 
-    # Create placeholder document row immediately (visible to frontend)
     state.store.create_document_placeholder(
         doc_id=actual_doc_id,
         file_id=file_id,
-        filename=name,
+        filename=_Path(doc_path).name,   # preserve collision suffix
         format=fmt,
         status="pending",
+        folder_id=target_folder_id,
+        path=doc_path,
     )
 
-    # Enqueue for background processing
-    job = IngestionJob(
-        file_id=file_id,
-        doc_id=actual_doc_id,
-    )
-    state.ingest_queue.submit(job)
+    state.ingest_queue.submit(IngestionJob(file_id=file_id, doc_id=actual_doc_id))
 
     return IngestAcceptedResponse(
         file_id=file_id,
@@ -247,10 +258,52 @@ def list_documents(
     offset: int = Query(0, ge=0),
     search: str | None = Query(None),
     status: str | None = Query(None),
+    path_filter: str | None = Query(
+        None,
+        description=(
+            "Filter by folder path. With recursive=true (default) matches the "
+            "whole subtree under the path; with recursive=false only direct "
+            "children of that folder. Same semantics as /api/v1/query's "
+            "path_filter. Trashed docs are always excluded."
+        ),
+    ),
+    recursive: bool = Query(
+        True,
+        description="When path_filter is set: true = subtree, false = direct children only.",
+    ),
     state: AppState = Depends(get_state),
 ):
-    rows = state.store.list_documents(limit=limit, offset=offset, search=search, status=status)
-    total = state.store.count_documents(status=status, search=search)
+    folder_id: str | None = None
+    path_prefix: str | None = None
+    if path_filter is not None:
+        if recursive:
+            # Subtree prefix match — uses Document.path LIKE index
+            path_prefix = path_filter
+        else:
+            # Direct-children only — resolve folder_id once (O(1) via path_lower index),
+            # then filter by indexed folder_id column.
+            from persistence.folder_service import FolderNotFound, FolderService
+
+            with state.store.transaction() as sess:
+                try:
+                    folder_id = FolderService(sess).require_by_path(path_filter).folder_id
+                except FolderNotFound:
+                    raise HTTPException(404, f"folder not found: {path_filter!r}")
+
+    rows = state.store.list_documents(
+        limit=limit,
+        offset=offset,
+        search=search,
+        status=status,
+        folder_id=folder_id,
+        path_prefix=path_prefix,
+    )
+    total = state.store.count_documents(
+        status=status,
+        search=search,
+        folder_id=folder_id,
+        path_prefix=path_prefix,
+    )
     return PaginatedResponse(
         items=[_doc_out(r, state) for r in rows],
         total=total,
@@ -331,9 +384,9 @@ def move_document(doc_id: str, body: "MoveDocumentReq", state: AppState = Depend
         join_path,
         unique_document_path,
     )
-    from persistence.permissions import Permission, PermissionService
+    from persistence.scope import ScopeMode, ScopeService
 
-    perm = PermissionService(state.store)
+    scope = ScopeService(state.store)
     row = state.store.get_document(doc_id)
     if not row:
         raise HTTPException(404, "document not found")
@@ -344,7 +397,7 @@ def move_document(doc_id: str, body: "MoveDocumentReq", state: AppState = Depend
             target = svc.require_by_path(body.to_path)
         except FolderNotFound:
             raise HTTPException(404, f"target folder not found: {body.to_path!r}")
-        perm.require_folder(target.folder_id, Permission.EDIT)
+        scope.require_folder(target.folder_id, ScopeMode.WRITE)
 
         from persistence.models import Document
         doc = sess.get(Document, doc_id)
@@ -381,9 +434,9 @@ def bulk_move_documents(body: "BulkMoveReq", state: AppState = Depends(get_state
         FolderService,
         unique_document_path,
     )
-    from persistence.permissions import Permission, PermissionService
+    from persistence.scope import ScopeMode, ScopeService
 
-    perm = PermissionService(state.store)
+    scope = ScopeService(state.store)
     moved: list[dict] = []
     errors: list[dict] = []
     with state.store.transaction() as sess:
@@ -392,7 +445,7 @@ def bulk_move_documents(body: "BulkMoveReq", state: AppState = Depends(get_state
             target = svc.require_by_path(body.to_path)
         except FolderNotFound:
             raise HTTPException(404, f"target folder not found: {body.to_path!r}")
-        perm.require_folder(target.folder_id, Permission.EDIT)
+        scope.require_folder(target.folder_id, ScopeMode.WRITE)
 
         from persistence.models import AuditLogRow, Document
 

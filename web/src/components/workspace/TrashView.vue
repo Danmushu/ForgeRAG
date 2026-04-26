@@ -52,6 +52,9 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { emptyTrash, listTrash, purgeTrashItems, restoreFromTrash } from '@/api'
+import { useDialog } from '@/composables/useDialog'
+
+const { confirm, toast } = useDialog()
 
 defineEmits(['back', 'changed'])
 
@@ -72,7 +75,12 @@ async function load() {
 }
 
 async function onRestore(item) {
-  if (!confirm(`Restore "${item.filename || item.name}" to its original location?`)) return
+  const ok = await confirm({
+    title: `Restore "${item.filename || item.name}"?`,
+    description: 'It will be moved back to its original location.',
+    confirmText: 'Restore',
+  })
+  if (!ok) return
   const body = item.type === 'folder'
     ? { folder_paths: [item.path] }
     : { doc_ids: [item.doc_id] }
@@ -80,13 +88,19 @@ async function onRestore(item) {
     await restoreFromTrash(body)
     await load()
   } catch (e) {
-    alert('Restore failed: ' + e.message)
+    toast('Restore failed: ' + e.message, { variant: 'error' })
   }
 }
 
 async function onPurge(item) {
   const name = item.filename || item.name
-  if (!confirm(`Permanently delete "${name}"? This cannot be undone.`)) return
+  const ok = await confirm({
+    title: `Permanently delete "${name}"?`,
+    description: 'This cannot be undone.',
+    confirmText: 'Delete forever',
+    variant: 'destructive',
+  })
+  if (!ok) return
   const body = item.type === 'folder'
     ? { folder_paths: [item.path] }
     : { doc_ids: [item.doc_id] }
@@ -94,18 +108,24 @@ async function onPurge(item) {
     await purgeTrashItems(body)
     await load()
   } catch (e) {
-    alert('Delete failed: ' + e.message)
+    toast('Delete failed: ' + e.message, { variant: 'error' })
   }
 }
 
 async function onEmpty() {
-  if (!confirm('Empty the entire recycle bin? All contents will be permanently deleted.')) return
-  if (!confirm('Really delete ' + items.value.length + ' items forever?')) return
+  const n = items.value.length
+  const ok = await confirm({
+    title: `Empty the recycle bin?`,
+    description: `All ${n} item${n === 1 ? '' : 's'} will be permanently deleted. This cannot be undone.`,
+    confirmText: 'Empty bin',
+    variant: 'destructive',
+  })
+  if (!ok) return
   try {
     await emptyTrash()
     await load()
   } catch (e) {
-    alert('Empty bin failed: ' + e.message)
+    toast('Empty bin failed: ' + e.message, { variant: 'error' })
   }
 }
 

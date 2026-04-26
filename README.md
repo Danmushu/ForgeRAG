@@ -67,7 +67,7 @@ We evaluate against [LightRAG](https://github.com/HKUDS/LightRAG) using the **Ul
 
 <p align="center"><img src="docs/images/chat_demo.gif" alt="ForgeRAG Demo" width="700"></p>
 
-Compared to heavier platforms like RAGFlow, ForgeRAG focuses on **core pipeline design** — a lean retrieval-answering chain you can deploy **out of the box**.
+Compared to heavier platforms like RAGFlow, ForgeRAG focuses on **core pipeline design** — a lean retrieval-answering chain with composable building blocks.
 
 🔍 **Dual-reasoning retrieval** · BM25 + vector pre-filter → LLM tree nav + KG, fused via RRF
 
@@ -79,7 +79,9 @@ Compared to heavier platforms like RAGFlow, ForgeRAG focuses on **core pipeline 
 
 📄 **Multi-format ingestion** · PDF, DOCX, PPTX, XLSX, HTML, Markdown, TXT
 
-🔌 **Pluggable & web config** · Swap any backend via Web UI, apply & restart in one click
+⚙️ **YAML-first config** · One file, one restart — no hidden runtime state
+
+🎛️ **Per-request overrides** · Toggle retrieval paths / top-ks / rerank per query via `QueryOverrides` (great for SDK + A/B)
 
 🏆 **Outperforms LightRAG** · 55.48% overall win rate on UltraDomain benchmark
 
@@ -185,11 +187,12 @@ Key endpoints:
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /api/v1/query` | Ask a question (streaming SSE or sync) |
-| `POST /api/v1/documents` | Upload and ingest a document |
-| `GET /api/v1/documents/{id}/tree` | Document hierarchical structure |
-| `GET /api/v1/graph` | Knowledge graph visualization |
-| `PUT /api/v1/settings/key/{key}` | Update config at runtime |
+| `POST /api/v1/query` | Ask a question (streaming SSE or sync) — accepts `path_filter` + `overrides` for per-request tuning |
+| `POST /api/v1/documents/upload-and-ingest` | Upload into a folder (multipart; `folder_path` form field) |
+| `GET  /api/v1/documents?path_filter=…&recursive=…` | List docs under a folder |
+| `GET  /api/v1/documents/{id}/tree` | Document hierarchical structure |
+| `GET  /api/v1/graph` | Knowledge graph visualization |
+| `GET  /api/v1/settings` | Read-only snapshot of effective cfg (yaml is authoritative) |
 
 ## Documentation
 
@@ -199,6 +202,7 @@ Key endpoints:
 - **[API Reference](docs/api-reference.md)** — REST API endpoints, request/response formats, SSE streaming
 - **[Deployment Guide](docs/deployment.md)** — Docker deploy, production checklist, Nginx, Ollama
 - **[Development Guide](docs/development.md)** — Dev setup, testing, adding new backends
+- **[Auth & Sessions](docs/auth.md)** — Single-admin password + SK tokens, web management UI, CLI playbook
 
 ## Project Structure
 

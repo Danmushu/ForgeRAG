@@ -103,7 +103,14 @@ def score_items(
     """
     bench_cfg = getattr(cfg, "benchmark", None)
     gen_cfg = cfg.answering.generator
-    use_independent_judge = bool(bench_cfg and bench_cfg.judge_provider_id)
+    # An independent judge is configured when benchmark.model is non-empty
+    # AND it isn't the same model as the generator. Anything else falls
+    # back to the generator with a self-preference-bias warning.
+    use_independent_judge = bool(
+        bench_cfg
+        and bench_cfg.model
+        and bench_cfg.model != gen_cfg.model
+    )
 
     if use_independent_judge:
         model = bench_cfg.model
@@ -125,8 +132,8 @@ def score_items(
         api_base = gen_cfg.api_base
         log.warning(
             "benchmark: no independent judge configured — reusing the Answer LLM "
-            "for scoring, which introduces self-preference bias. Set benchmark."
-            "judge_provider_id to a different provider for rigorous A/B scoring."
+            "for scoring, which introduces self-preference bias. Set benchmark.model "
+            "(and api_base / api_key_env) to a different model for rigorous scoring."
         )
 
     import litellm

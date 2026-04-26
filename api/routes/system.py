@@ -30,22 +30,17 @@ router = APIRouter(prefix="/api/v1/system", tags=["system"])
 
 @router.post("/restart")
 def restart_server(state: AppState = Depends(get_state)):
-    """Apply DB settings then restart the server process.
+    """Restart the server process to pick up yaml changes.
 
-    Works by sending SIGTERM to the current process after a short delay.
-    Uvicorn's process manager (or Docker/systemd) will restart it.
-    With ``--workers N``, only the handling worker dies and is respawned.
+    Sends SIGTERM to the current process after a short delay — uvicorn
+    (or Docker/systemd) restarts it. With ``--workers N``, only the
+    handling worker dies and is respawned.
     """
     import os
     import signal
     import threading
 
-    from config.settings_manager import apply_overrides, resolve_providers
-
-    # Apply settings first so the restart picks them up
-    count = apply_overrides(state.cfg, state.store)
-    resolved = resolve_providers(state.cfg, state.store)
-    log.info("restart: applied %d overrides, %d providers; sending SIGTERM in 1s", count, resolved)
+    log.info("restart: sending SIGTERM in 1s to pick up yaml changes")
 
     def _kill():
         import time
@@ -54,7 +49,7 @@ def restart_server(state: AppState = Depends(get_state)):
         os.kill(os.getpid(), signal.SIGTERM)
 
     threading.Thread(target=_kill, daemon=True).start()
-    return {"status": "restarting", "applied": count, "providers_resolved": resolved}
+    return {"status": "restarting"}
 
 
 # ---------------------------------------------------------------------------
