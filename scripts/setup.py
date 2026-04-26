@@ -822,8 +822,10 @@ def _ask_credentials(
             api_key_plain = ask(_t("API key", "API key"), allow_empty=False)
             api_key_env = ""
     api_base = ask(
-        _t("Custom api_base (Ollama / OpenRouter / OneAPI / Azure URL)",
-           "自定义 api_base (Ollama / OpenRouter / OneAPI / Azure 地址)"),
+        _t(
+            "Custom api_base (e.g. https://api.siliconflow.cn/v1 — leave blank for OpenAI)",
+            "自定义 api_base (例如 https://api.siliconflow.cn/v1 — 留空走 OpenAI)",
+        ),
         default=defaults.get(
             "llm_api_base" if "llm" in prefix_en.lower() else "embedder_api_base",
             base_default,
@@ -894,16 +896,24 @@ def _step_graph(answers: dict, defaults: dict) -> None:
 def _step_embedder(answers: dict, defaults: dict) -> None:
     while True:
         print(_c(_t(
-            "  The embedding model converts text into vectors.",
-            "  向量嵌入模型把文本转换为向量。",
+            "  The embedding model converts text into vectors. Examples:",
+            "  向量嵌入模型把文本转换为向量。常见模型：",
         ), "dim"))
         print(_c(_t(
-            "  Common: openai/text-embedding-3-small (1536),",
-            "  常见模型: openai/text-embedding-3-small (1536),",
+            "    OpenAI:      openai/text-embedding-3-small (1536)",
+            "    OpenAI:      openai/text-embedding-3-small (1536)",
         ), "dim"))
         print(_c(_t(
-            "  openai/text-embedding-3-large (3072), ollama/bge-m3 (1024).",
-            "  openai/text-embedding-3-large (3072), ollama/bge-m3 (1024)。",
+            "                 openai/text-embedding-3-large (3072)",
+            "                 openai/text-embedding-3-large (3072)",
+        ), "dim"))
+        print(_c(_t(
+            "    SiliconFlow: openai/BAAI/bge-m3 (1024)  + api_base=https://api.siliconflow.cn/v1",
+            "    SiliconFlow: openai/BAAI/bge-m3 (1024)  + api_base=https://api.siliconflow.cn/v1",
+        ), "dim"))
+        print(_c(_t(
+            "    Local:       ollama/bge-m3 (1024)        + api_base=http://localhost:11434",
+            "    本地 Ollama: ollama/bge-m3 (1024)        + api_base=http://localhost:11434",
         ), "dim"))
         answers["embedder_model"] = ask(
             _t("Embedding model (litellm format)", "嵌入模型 (litellm 格式)"),
@@ -956,16 +966,24 @@ def _step_embedder(answers: dict, defaults: dict) -> None:
 def _step_llm(answers: dict, defaults: dict) -> None:
     while True:
         print(_c(_t(
-            "  The answer-generation LLM produces the final answer text.",
-            "  答案生成大模型负责输出最终的回答文本。",
+            "  The answer-generation LLM produces the final answer text. Examples:",
+            "  答案生成大模型负责输出最终的回答文本。常见模型：",
         ), "dim"))
         print(_c(_t(
-            "  Any litellm-compatible model works (OpenAI / Anthropic / DeepSeek /",
-            "  支持任何 litellm 兼容模型 (OpenAI / Anthropic / DeepSeek /",
+            "    OpenAI:      openai/gpt-4o-mini",
+            "    OpenAI:      openai/gpt-4o-mini",
         ), "dim"))
         print(_c(_t(
-            "  Ollama / OpenRouter / Azure / Bedrock / Vertex / ...).",
-            "  Ollama / OpenRouter / Azure / Bedrock / Vertex / …)。",
+            "    Anthropic:   anthropic/claude-3-5-sonnet-latest",
+            "    Anthropic:   anthropic/claude-3-5-sonnet-latest",
+        ), "dim"))
+        print(_c(_t(
+            "    SiliconFlow: openai/deepseek-ai/DeepSeek-V3  + api_base=https://api.siliconflow.cn/v1",
+            "    SiliconFlow: openai/deepseek-ai/DeepSeek-V3  + api_base=https://api.siliconflow.cn/v1",
+        ), "dim"))
+        print(_c(_t(
+            "    Local:       ollama/qwen2.5                  + api_base=http://localhost:11434",
+            "    本地 Ollama: ollama/qwen2.5                  + api_base=http://localhost:11434",
         ), "dim"))
         answers["llm_model"] = ask(
             _t("Generator model (litellm format)", "生成模型 (litellm 格式)"),
@@ -1074,6 +1092,18 @@ def _step_image_enrichment(answers: dict, defaults: dict) -> None:
     answers["image_enrichment_enabled"] = enable
     if not enable:
         return
+    print(_c(_t(
+        "  Vision-capable model examples:",
+        "  视觉大模型常见示例：",
+    ), "dim"))
+    print(_c(_t(
+        "    OpenAI:      openai/gpt-4o-mini",
+        "    OpenAI:      openai/gpt-4o-mini",
+    ), "dim"))
+    print(_c(_t(
+        "    SiliconFlow: openai/Qwen/Qwen2-VL-72B-Instruct  + api_base=https://api.siliconflow.cn/v1",
+        "    SiliconFlow: openai/Qwen/Qwen2-VL-72B-Instruct  + api_base=https://api.siliconflow.cn/v1",
+    ), "dim"))
     answers["image_enrichment_model"] = ask(
         _t("Vision LLM model (must be vision-capable)",
            "视觉大模型 (需要支持视觉输入)"),
