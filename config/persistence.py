@@ -28,6 +28,11 @@ from pydantic import BaseModel, Field, model_validator
 
 log = logging.getLogger(__name__)
 
+# Module-level flag so we warn at most once per process. Without this
+# every config reload (and every uvicorn worker re-import) re-emits the
+# same banner — turning the startup log into noise.
+_sqlite_warned = False
+
 # ---------------------------------------------------------------------------
 # Relational
 # ---------------------------------------------------------------------------
@@ -73,12 +78,15 @@ class RelationalConfig(BaseModel):
         if self.backend == "sqlite":
             if self.sqlite is None:
                 self.sqlite = SQLiteConfig()
-            log.warning(
-                "relational.backend=sqlite selected. SQLite serialises all "
-                "writes — running uvicorn with --workers > 1 will queue writers "
-                "behind one another. Switch to PostgreSQL for multi-worker "
-                "production deployments."
-            )
+            global _sqlite_warned
+            if not _sqlite_warned:
+                _sqlite_warned = True
+                log.warning(
+                    "relational.backend=sqlite selected. SQLite serialises all "
+                    "writes - running uvicorn with --workers > 1 will queue writers "
+                    "behind one another. Switch to PostgreSQL for multi-worker "
+                    "production deployments."
+                )
         return self
 
 

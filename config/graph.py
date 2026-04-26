@@ -25,6 +25,10 @@ from pydantic import BaseModel, Field, model_validator
 
 log = logging.getLogger(__name__)
 
+# Module-level flag so the multi-worker warning fires once per process,
+# not once per config reload (validators re-run on every load).
+_networkx_warned = False
+
 
 class NetworkXConfig(BaseModel):
     path: str = "./storage/kg.json"
@@ -62,10 +66,13 @@ class GraphConfig(BaseModel):
     @model_validator(mode="after")
     def _warn_on_networkx(self) -> GraphConfig:
         if self.backend == "networkx":
-            log.warning(
-                "graph.backend=networkx selected. This backend is single-"
-                "worker only — running uvicorn with --workers > 1 will "
-                "corrupt the JSON dump on concurrent writes. Switch to "
-                "Neo4j for multi-worker production deployments."
-            )
+            global _networkx_warned
+            if not _networkx_warned:
+                _networkx_warned = True
+                log.warning(
+                    "graph.backend=networkx selected. This backend is single-"
+                    "worker only - running uvicorn with --workers > 1 will "
+                    "corrupt the JSON dump on concurrent writes. Switch to "
+                    "Neo4j for multi-worker production deployments."
+                )
         return self
