@@ -308,12 +308,18 @@ def _resolve_key(api_key: str | None, api_key_env: str | None) -> str | None:
     return None
 
 
-def _test_embedding(model: str, key: str | None, base: str | None, *, timeout: float = 30.0) -> tuple[bool, str]:
-    """Call litellm.embedding once with a short input. Returns (ok, message)."""
+def _test_embedding(
+    model: str, key: str | None, base: str | None, *, timeout: float = 30.0
+) -> tuple[bool, str, int | None]:
+    """Call litellm.embedding once with a short input.
+
+    Returns ``(ok, message, dim)``. ``dim`` is the detected output
+    dimension on success and None on any failure.
+    """
     try:
         from litellm import embedding  # type: ignore
     except ImportError as e:
-        return False, f"litellm not installed: {e}"
+        return False, f"litellm not installed: {e}", None
     try:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -329,14 +335,15 @@ def _test_embedding(model: str, key: str | None, base: str | None, *, timeout: f
         # 200 OK with non-embedding JSON still surfaces a clear error.
         data = getattr(resp, "data", None)
         if not data:
-            return False, "response had no 'data' field"
+            return False, "response had no 'data' field", None
         first = data[0]
         vec = first.get("embedding") if isinstance(first, dict) else getattr(first, "embedding", None)
         if not vec:
-            return False, "first 'data' entry had no embedding"
-        return True, f"ok (dim={len(vec)})"
+            return False, "first 'data' entry had no embedding", None
+        dim = len(vec)
+        return True, f"ok (dim={dim})", dim
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"{type(e).__name__}: {e}", None
 
 
 def _test_completion(model: str, key: str | None, base: str | None, *, timeout: float = 30.0) -> tuple[bool, str]:
@@ -518,17 +525,13 @@ def _ask_credentials(prefix_label: str, defaults: dict, key_env: str, base_defau
 
 def _step_embedder(answers: dict, defaults: dict) -> None:
     while True:
-        print(_c("  The embedding model converts text into vectors. Its output", "dim"))
-        print(_c("  dimension MUST match your vector store's `dimension`.", "dim"))
-        print(_c("  Common: 1536 (OpenAI small), 3072 (OpenAI large), 1024 (BGE-M3).", "dim"))
+        print(_c("  The embedding model converts text into vectors.", "dim"))
+        print(_c("  Common: openai/text-embedding-3-small (1536),", "dim"))
+        print(_c("  openai/text-embedding-3-large (3072), ollama/bge-m3 (1024).", "dim"))
         answers["embedder_model"] = ask(
             "Embedding model (litellm format)",
             default=answers.get("embedder_model")
                 or defaults.get("embedder_model", "openai/text-embedding-3-small"),
-        )
-        answers["embedder_dim"] = ask_int(
-            "Embedding dimension",
-            default=answers.get("embedder_dim") or defaults.get("embedder_dim", 1536),
         )
         api_key_env, api_key_plain, api_base = _ask_credentials(
             "Embedder", defaults, "embedder_api_key_env", ""
@@ -537,13 +540,15 @@ def _step_embedder(answers: dict, defaults: dict) -> None:
         answers["embedder_api_key"] = api_key_plain
         answers["embedder_api_base"] = api_base
 
-        # Live test
+        # Live test — auto-detects the output dimension from the response.
         print()
-        print(_c("  testing embedding endpoint…", "dim"))
+        print(_c("  testing embedding endpoint (auto-detecting dimension)…", "dim"))
         key = _resolve_key(api_key_plain, api_key_env)
-        ok, msg = _test_embedding(answers["embedder_model"], key, api_base or None)
-        if ok:
+        ok, msg, dim = _test_embedding(answers["embedder_model"], key, api_base or None)
+        if ok and dim:
+            answers["embedder_dim"] = dim
             print(_c(f"  ✓ {msg}", "green"))
+            print(_c(f"  → embedder.dimension auto-set to {dim}", "dim"))
             return
         choice = _confirm_test_failure("Embedding", msg)
         if choice == "retry":
@@ -552,7 +557,13 @@ def _step_embedder(answers: dict, defaults: dict) -> None:
             raise _GoBack()
         if choice == "abort":
             raise Aborted()
-        # "skip" — accept and move on
+        # "skip" — fall back to asking for the dimension since we couldn't
+        # detect it from a live call.
+        print(_c("  test was skipped — please enter the dimension manually.", "yellow"))
+        answers["embedder_dim"] = ask_int(
+            "Embedding dimension",
+            default=answers.get("embedder_dim") or defaults.get("embedder_dim", 1536),
+        )
         return
 
 
