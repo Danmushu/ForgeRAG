@@ -1098,6 +1098,78 @@ _STEPS: list[tuple[str, str, Callable[[dict, dict], None]]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint / resume
+#
+# After every step we persist the running ``answers`` dict next to the
+# would-be output yaml as ``<yaml>.wizard-state.json``. If the wizard is
+# interrupted (Ctrl-C, pip-install crash, terminal close) the next run
+# offers to resume from the last completed step instead of redoing
+# everything. Erased on successful yaml write.
+# ---------------------------------------------------------------------------
+
+
+_CHECKPOINT_VERSION = 1
+
+
+def _checkpoint_path(yaml_path: Path) -> Path:
+    return yaml_path.with_suffix(yaml_path.suffix + ".wizard-state.json")
+
+
+def _save_checkpoint(
+    yaml_path: Path,
+    answers: dict[str, Any],
+    *,
+    profile: str,
+    lang: str,
+    next_step_idx: int,
+) -> None:
+    import json
+
+    payload = {
+        "version": _CHECKPOINT_VERSION,
+        "profile": profile,
+        "lang": lang,
+        "next_step_idx": next_step_idx,
+        "answers": answers,
+    }
+    cp = _checkpoint_path(yaml_path)
+    try:
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        # Checkpointing is best-effort — never abort the wizard for it.
+        print(_c(_t(
+            f"  (warning: failed to save wizard checkpoint: {e})",
+            f"  （警告：保存向导进度失败：{e}）",
+        ), "dim"))
+
+
+def _load_checkpoint(yaml_path: Path) -> dict[str, Any] | None:
+    import json
+
+    cp = _checkpoint_path(yaml_path)
+    if not cp.exists():
+        return None
+    try:
+        data = json.loads(cp.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("version") != _CHECKPOINT_VERSION:
+        return None
+    return data
+
+
+def _delete_checkpoint(yaml_path: Path) -> None:
+    cp = _checkpoint_path(yaml_path)
+    try:
+        cp.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass  # not worth surfacing
+
+
 def _non_interactive_defaults(profile: str) -> dict[str, Any]:
     d = _profile_defaults(profile)
     if not d:
@@ -1124,8 +1196,18 @@ def _non_interactive_defaults(profile: str) -> dict[str, Any]:
     return d
 
 
-def run_wizard(profile: str, non_interactive: bool) -> dict[str, Any]:
-    """Return a dict of answers that the yaml builder consumes."""
+def run_wizard(
+    profile: str,
+    non_interactive: bool,
+    *,
+    output_path: Path | None = None,
+) -> dict[str, Any]:
+    """Return a dict of answers that the yaml builder consumes.
+
+    ``output_path`` is the path where the yaml will eventually be written;
+    used as the anchor for the wizard-state.json checkpoint file. If
+    omitted, no checkpointing happens (e.g. non-interactive runs).
+    """
     defaults = _profile_defaults(profile)
 
     if non_interactive:
@@ -1136,6 +1218,47 @@ def run_wizard(profile: str, non_interactive: bool) -> dict[str, Any]:
         return d
 
     banner(_t("ForgeRAG setup wizard", "ForgeRAG 安装向导"))
+
+    answers: dict[str, Any] = {}
+    i = 0
+
+    # ── Resume from a previous checkpoint? ──
+    if output_path is not None:
+        checkpoint = _load_checkpoint(output_path)
+        if checkpoint is not None:
+            cp_profile = checkpoint.get("profile", "?")
+            cp_step = int(checkpoint.get("next_step_idx", 0))
+            cp_step = max(0, min(cp_step, len(_STEPS)))
+            cp_step_name_en = _STEPS[cp_step][0] if cp_step < len(_STEPS) else "(done)"
+            cp_step_name_zh = _STEPS[cp_step][1] if cp_step < len(_STEPS) else "（已完成）"
+            print(_c(_t(
+                f"  Found unfinished setup from a previous run "
+                f"(profile={cp_profile}, next step: {cp_step_name_en}).",
+                f"  检测到上次未完成的安装进度 "
+                f"(profile={cp_profile}，下一步：{cp_step_name_zh})。",
+            ), "yellow"))
+            choice = ask_choice(
+                _t("Resume or start fresh?", "继续还是重新开始？"),
+                [
+                    ("resume", _t("resume from where I left off",
+                                  "从中断处继续")),
+                    ("fresh",  _t("discard the checkpoint and start over",
+                                  "丢弃进度，重新开始")),
+                ],
+                default="resume",
+            )
+            if choice == "resume":
+                answers = dict(checkpoint.get("answers") or {})
+                # If the saved language differs from the active one, keep
+                # the active one (user just selected it on this run).
+                i = cp_step
+                if i >= len(_STEPS):
+                    # Saved checkpoint says all steps done — caller will
+                    # write yaml directly. Don't re-prompt anything.
+                    return answers
+            else:
+                _delete_checkpoint(output_path)
+
     print(_c(_t(
         "  Press Enter to accept the default in [yellow].",
         "  按回车接受 [黄色] 中的默认值。",
@@ -1144,10 +1267,9 @@ def run_wizard(profile: str, non_interactive: bool) -> dict[str, Any]:
         "  Type 'b' / 'back' / '<' to re-open the previous step.",
         "  在任何提问处输入 'b' / 'back' / '<' 可返回上一步。",
     ), "dim"))
-    print(_c(_t("  Ctrl-C to abort.", "  按 Ctrl-C 中止。"), "dim"))
+    print(_c(_t("  Ctrl-C to abort. Progress is auto-saved after each step.",
+               "  按 Ctrl-C 中止。每步完成后自动保存进度。"), "dim"))
 
-    answers: dict[str, Any] = {}
-    i = 0
     while i < len(_STEPS):
         title_en, title_zh, fn = _STEPS[i]
         section(f"{i + 1}/{len(_STEPS)}  {_t(title_en, title_zh)}")
@@ -1163,6 +1285,13 @@ def run_wizard(profile: str, non_interactive: bool) -> dict[str, Any]:
             i -= 1
             continue
         i += 1
+        # Persist progress after each successfully completed step so a
+        # subsequent crash / Ctrl-C can resume from i (the next pending one).
+        if output_path is not None:
+            _save_checkpoint(
+                output_path, answers,
+                profile=profile, lang=_LANG, next_step_idx=i,
+            )
 
     section(_t("Done!", "完成！"))
     return answers
@@ -1624,9 +1753,16 @@ def main() -> int:
         return 2
 
     try:
-        answers = run_wizard(args.profile, args.non_interactive)
+        answers = run_wizard(
+            args.profile,
+            args.non_interactive,
+            output_path=None if args.non_interactive else args.output,
+        )
     except Aborted:
-        print(_t("\n  aborted.", "\n  已中止。"))
+        print(_t(
+            "\n  aborted. Progress saved — re-run the wizard to resume.",
+            "\n  已中止。进度已保存 — 重新运行向导可继续。",
+        ))
         return 130
 
     cfg_dict = build_config_dict(answers)
@@ -1638,6 +1774,11 @@ def main() -> int:
             f"  写入 {args.output} 失败：{e}",
         ), "magenta"))
         return 1
+
+    # Yaml is durable now — the wizard's job is done. Remove the
+    # checkpoint so the next run doesn't offer a stale resume.
+    if not args.non_interactive:
+        _delete_checkpoint(args.output)
 
     print()
     print(_c(_t(f"  wrote {args.output}", f"  已写入 {args.output}"), "green"))
