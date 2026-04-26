@@ -140,3 +140,27 @@ def mark_failed(sess: Session, op_id: str, error: str) -> None:
             error_msg=error[:2000],
         )
     )
+
+
+def purge_completed(sess: Session, *, older_than_days: int = 7) -> int:
+    """Delete ``done`` rows whose ``finished_at`` is older than the cutoff.
+
+    Called from nightly maintenance. ``failed`` rows are intentionally
+    NOT purged here — they're useful for incident review; an operator
+    decides when to drop them.
+
+    Returns the number of rows deleted.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import delete
+
+    cutoff = datetime.utcnow() - timedelta(days=max(0, older_than_days))
+    res = sess.execute(
+        delete(PendingFolderOp).where(
+            PendingFolderOp.status == "done",
+            PendingFolderOp.finished_at.is_not(None),
+            PendingFolderOp.finished_at < cutoff,
+        )
+    )
+    return res.rowcount or 0

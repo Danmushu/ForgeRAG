@@ -613,7 +613,27 @@ def unique_document_path(
     `documents` under the same folder, append `(1)`, `(2)`, ... before
     the extension until unique. Case-insensitive comparison using a
     single-folder scan (cheap — a folder has at most a few hundred docs).
+
+    Concurrency: takes a row lock on the parent folder before scanning so
+    two parallel uploads of the same filename to the same folder serialise
+    on the lock instead of both picking the same suffix and writing
+    duplicate paths. SQLite ignores ``with_for_update`` (single writer
+    anyway via WAL); Postgres / MySQL honour it.
     """
+    # Lock the parent folder row so concurrent uploads to the same folder
+    # serialize through this path-allocation step.
+    try:
+        sess.execute(
+            select(Folder.folder_id)
+            .where(Folder.folder_id == folder.folder_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+    except Exception:
+        # Backend doesn't support row-level locking (e.g. SQLite under
+        # certain isolation modes) — fall through. WAL serialises writers,
+        # so for SQLite the race window is naturally narrow.
+        pass
+
     # Only docs in the same folder can collide on filename
     existing_paths = set(
         (p or "").lower()

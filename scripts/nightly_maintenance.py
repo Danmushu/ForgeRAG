@@ -66,6 +66,7 @@ def main() -> int:
         claim_next_batch,
         mark_done,
         mark_failed,
+        purge_completed,
     )
 
     cfg = load_config()
@@ -126,6 +127,17 @@ def main() -> int:
                     else:
                         mark_failed(sess, op_id, err)
                 processed += 1
+
+        # Garbage-collect ``done`` rows older than 7d so the queue table
+        # doesn't grow without bound. ``failed`` rows are kept for
+        # incident review (operator decides when to drop them).
+        try:
+            with store.transaction() as sess:
+                purged = purge_completed(sess, older_than_days=7)
+            if purged:
+                log.info("purged %d completed pending_folder_ops row(s)", purged)
+        except Exception:
+            log.exception("pending_folder_ops purge failed")
 
         log.info(
             "nightly maintenance done: %d op(s) in %.1fs",
