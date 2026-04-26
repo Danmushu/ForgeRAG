@@ -1,9 +1,17 @@
 """
 Interactive setup wizard for ForgeRAG.
 
-Guides the user through a handful of high-level choices, writes a
-forgerag.yaml that reflects them, validates it, and optionally
-launches batch ingestion or the HTTP API.
+Walks the user through six small steps and writes a forgerag.yaml
+that wires the relational store, vector store, blob storage,
+embedder, and answer-generation LLM end-to-end. The embedder and
+LLM steps each finish with a real connection test (live API call)
+so a typo in api_base or a wrong key surfaces immediately, before
+the user discovers it the first time they try to ingest a document.
+
+Navigation:
+    Enter          accept the default in [yellow]
+    b / back / <   re-open the previous step
+    Ctrl-C         abort
 
 Usage:
     python scripts/setup.py                       # interactive wizard
@@ -11,8 +19,8 @@ Usage:
     python scripts/setup.py --profile prod -o myconfig.yaml
 
 Profiles:
-    dev    -- SQLite + ChromaDB + local blob + OpenAI models
-    prod   -- Postgres + pgvector + local blob + OpenAI models
+    dev    -- ChromaDB + local blob + OpenAI defaults
+    prod   -- pgvector + local blob + OpenAI defaults
     custom -- full wizard, no presets
 """
 
@@ -26,6 +34,15 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+# Force UTF-8 on stdout/stderr so the box-drawing / arrow characters in
+# banners render on Windows consoles where the default codepage is GBK
+# (otherwise UnicodeEncodeError aborts the wizard mid-prompt).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError, OSError):
+        pass
 
 # Let the wizard run from the repo root without install.
 _HERE = Path(__file__).resolve().parent
@@ -123,7 +140,20 @@ def section(title: str) -> None:
 
 
 class Aborted(Exception):
-    pass
+    """Ctrl-C / EOF — stop the whole wizard."""
+
+
+class _GoBack(Exception):
+    """User typed 'b' / 'back' / '<' — re-run the previous step."""
+
+
+# Tokens that trigger _GoBack when entered at any prompt.
+_BACK_TOKENS = {"b", "back", "<"}
+
+
+def _check_back(raw: str) -> None:
+    if raw.lower() in _BACK_TOKENS:
+        raise _GoBack()
 
 
 def ask(
@@ -135,7 +165,8 @@ def ask(
 ) -> str:
     """
     Ask for free-form text input. Returns the value (or the default).
-    `validator` may return an error message to force a retry.
+    `validator` may return an error message to force a retry. Typing
+    ``b`` / ``back`` / ``<`` raises ``_GoBack``.
     """
     suffix = f" [{_c(default, 'yellow')}]" if default else ""
     while True:
@@ -143,6 +174,7 @@ def ask(
             raw = input(f"  {question}{suffix}: ").strip()
         except (EOFError, KeyboardInterrupt):
             raise Aborted()
+        _check_back(raw)
         if not raw and default is not None:
             raw = default
         if not raw and not allow_empty:
@@ -163,6 +195,7 @@ def ask_bool(question: str, default: bool = False) -> bool:
             raw = input(f"  {question} [{_c(tip, 'yellow')}]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             raise Aborted()
+        _check_back(raw)
         if not raw:
             return default
         if raw in ("y", "yes"):
@@ -194,6 +227,7 @@ def ask_choice(
             ).strip()
         except (EOFError, KeyboardInterrupt):
             raise Aborted()
+        _check_back(raw)
         if not raw and default_str:
             raw = default_str
         if raw.isdigit():
@@ -209,6 +243,7 @@ def ask_int(question: str, default: int, *, min_: int = 1) -> int:
             raw = input(f"  {question} [{_c(str(default), 'yellow')}]: ").strip()
         except (EOFError, KeyboardInterrupt):
             raise Aborted()
+        _check_back(raw)
         if not raw:
             return default
         try:
@@ -226,57 +261,144 @@ def ask_int(question: str, default: int, *, min_: int = 1) -> int:
 
 
 def _profile_defaults(profile: str) -> dict[str, Any]:
+    base = {
+        "embedder_model": "openai/text-embedding-3-small",
+        "embedder_dim": 1536,
+        "embedder_api_key_env": "OPENAI_API_KEY",
+        "embedder_api_base": "",
+        "llm_model": "openai/gpt-4o-mini",
+        "llm_api_key_env": "OPENAI_API_KEY",
+        "llm_api_base": "",
+    }
     if profile == "dev":
         return {
-            "relational": "sqlite",
-            "sqlite_path": "./storage/forgerag.db",
+            **base,
             "vector": "chromadb",
             "chroma_dir": "./storage/chroma",
-            "chroma_dim": 1536,
             "blob": "local",
             "blob_root": "./storage/blobs",
-            "embedder_dim": 1536,
         }
     if profile == "prod":
         return {
-            "relational": "postgres",
+            **base,
             "pg_host": "localhost",
             "pg_port": 5432,
             "pg_database": "forgerag",
             "pg_user": "forgerag",
             "pg_password_env": "PG_PASSWORD",
             "vector": "pgvector",
-            "pgvector_dim": 1024,
+            "embedder_dim": 1024,
             "blob": "local",
             "blob_root": "./storage/blobs",
-            "embedder_dim": 1024,
         }
     return {}
 
 
 # ---------------------------------------------------------------------------
-# The wizard
+# Connection tests
 # ---------------------------------------------------------------------------
 
 
-def run_wizard(profile: str, non_interactive: bool) -> dict[str, Any]:
-    """Return a dict of answers that the yaml builder consumes."""
-    answers: dict[str, Any] = {}
-    defaults = _profile_defaults(profile)
+def _resolve_key(api_key: str | None, api_key_env: str | None) -> str | None:
+    """Return the effective key: explicit > env. None if neither is set."""
+    if api_key:
+        return api_key
+    if api_key_env:
+        return os.environ.get(api_key_env)
+    return None
 
-    if non_interactive:
-        if not defaults:
-            print("error: --non-interactive requires --profile dev|prod", file=sys.stderr)
-            raise Aborted()
-        return defaults
 
-    banner("ForgeRAG setup wizard")
-    print("  Answer a few questions to generate forgerag.yaml.")
-    print("  Press Enter to accept defaults. Ctrl-C to abort.")
+def _test_embedding(model: str, key: str | None, base: str | None, *, timeout: float = 30.0) -> tuple[bool, str]:
+    """Call litellm.embedding once with a short input. Returns (ok, message)."""
+    try:
+        from litellm import embedding  # type: ignore
+    except ImportError as e:
+        return False, f"litellm not installed: {e}"
+    try:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "input": ["ping"],
+            "timeout": timeout,
+        }
+        if key:
+            kwargs["api_key"] = key
+        if base:
+            kwargs["api_base"] = base
+        resp = embedding(**kwargs)
+        # Probe the response shape so a misconfigured proxy that returns
+        # 200 OK with non-embedding JSON still surfaces a clear error.
+        data = getattr(resp, "data", None)
+        if not data:
+            return False, "response had no 'data' field"
+        first = data[0]
+        vec = first.get("embedding") if isinstance(first, dict) else getattr(first, "embedding", None)
+        if not vec:
+            return False, "first 'data' entry had no embedding"
+        return True, f"ok (dim={len(vec)})"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
-    # ----- Relational store -----
-    section("1/6  Metadata database")
-    # ForgeRAG production requires PostgreSQL.
+
+def _test_completion(model: str, key: str | None, base: str | None, *, timeout: float = 30.0) -> tuple[bool, str]:
+    """Call litellm.completion once with a tiny prompt. Returns (ok, message)."""
+    try:
+        from litellm import completion  # type: ignore
+    except ImportError as e:
+        return False, f"litellm not installed: {e}"
+    try:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply with the single word: pong"}],
+            "max_tokens": 10,
+            "temperature": 0.0,
+            "timeout": timeout,
+        }
+        if key:
+            kwargs["api_key"] = key
+        if base:
+            kwargs["api_base"] = base
+        resp = completion(**kwargs)
+        choices = getattr(resp, "choices", None)
+        if not choices:
+            return False, "response had no choices"
+        first = choices[0]
+        msg = first.message if hasattr(first, "message") else first.get("message", {})
+        text = (msg.content if hasattr(msg, "content") else msg.get("content", "")) or ""
+        text = text.strip()[:60]
+        return True, f"ok ({text!r})"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _confirm_test_failure(target: str, error: str) -> str:
+    """
+    Show the test error and ask what to do. Returns one of:
+      "retry" — re-run the same step
+      "back"  — go back to the previous step (raise _GoBack to caller)
+      "skip"  — accept the values without a successful test
+      "abort" — stop the wizard
+    """
+    print()
+    print(_c(f"  ✗ {target} connection test FAILED:", "magenta"))
+    print(_c(f"    {error}", "dim"))
+    return ask_choice(
+        "What now?",
+        [
+            ("retry", "fix the values and try again"),
+            ("back",  "go back to the previous step"),
+            ("skip",  "save anyway (you can fix it via /settings later)"),
+            ("abort", "exit the wizard"),
+        ],
+        default="retry",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Steps
+# ---------------------------------------------------------------------------
+
+
+def _step_postgres(answers: dict, defaults: dict) -> None:
     answers["relational"] = "postgres"
     answers["pg_host"] = ask("Postgres host", default=defaults.get("pg_host", "localhost"))
     answers["pg_port"] = ask_int("Postgres port", default=defaults.get("pg_port", 5432))
@@ -286,29 +408,21 @@ def run_wizard(profile: str, non_interactive: bool) -> dict[str, Any]:
         "Env var containing the password",
         default=defaults.get("pg_password_env", "PG_PASSWORD"),
     )
-
     _ensure_backend_package(_RELATIONAL_PACKAGES, answers["relational"])
 
-    # ----- Vector store -----
-    section("2/6  Vector database")
-    standalone_vectors = [
+
+def _step_vector(answers: dict, defaults: dict) -> None:
+    standalone = [
         ("chromadb", "ChromaDB — lightweight, backend-agnostic"),
-        ("qdrant", "Qdrant — production-grade, rich filtering"),
-        ("milvus", "Milvus — scalable, GPU-accelerated"),
+        ("qdrant",   "Qdrant — production-grade, rich filtering"),
+        ("milvus",   "Milvus — scalable, GPU-accelerated"),
         ("weaviate", "Weaviate — multi-modal, GraphQL API"),
     ]
-    if answers["relational"] == "postgres":
-        valid_vectors = [("pgvector", "pgvector — in-database, zero extra ops"), *standalone_vectors]
-    else:
-        valid_vectors = standalone_vectors
-    default_vec = defaults.get("vector", valid_vectors[0][0])
-    if default_vec not in [v for v, _ in valid_vectors]:
-        default_vec = valid_vectors[0][0]
-    answers["vector"] = ask_choice(
-        "Which vector backend?",
-        valid_vectors,
-        default=default_vec,
-    )
+    valid = [("pgvector", "pgvector — in-database, zero extra ops"), *standalone]
+    default_vec = defaults.get("vector", valid[0][0])
+    if default_vec not in [v for v, _ in valid]:
+        default_vec = valid[0][0]
+    answers["vector"] = ask_choice("Which vector backend?", valid, default=default_vec)
     if answers["vector"] == "chromadb":
         answers["chroma_dir"] = ask(
             "Chroma persist_directory",
@@ -329,17 +443,16 @@ def run_wizard(profile: str, non_interactive: bool) -> dict[str, Any]:
             "Weaviate server URL",
             default=defaults.get("weaviate_url", "http://localhost:8080"),
         )
-
     _ensure_backend_package(_VECTOR_PACKAGES, answers["vector"])
 
-    # ----- Blob storage -----
-    section("3/6  Blob storage (figures + uploaded files)")
+
+def _step_blob(answers: dict, defaults: dict) -> None:
     answers["blob"] = ask_choice(
         "Where should blobs live?",
         [
             ("local", "filesystem, single node"),
-            ("s3", "any S3-compatible service"),
-            ("oss", "Alibaba Cloud OSS"),
+            ("s3",    "any S3-compatible service"),
+            ("oss",   "Alibaba Cloud OSS"),
         ],
         default=defaults.get("blob", "local"),
     )
@@ -372,26 +485,179 @@ def run_wizard(profile: str, non_interactive: bool) -> dict[str, Any]:
             default="",
             allow_empty=True,
         )
-
     _ensure_backend_package(_BLOB_PACKAGES, answers["blob"])
 
-    # ----- Embedding dimension -----
-    section("4/4  Embedding dimension")
-    print(_c("  The embedding dimension must match your model's output.", "dim"))
-    print(_c("  Common values: 1536 (OpenAI small), 3072 (OpenAI large),", "dim"))
-    print(_c("  1024 (BGE-M3, Cohere), 768 (many smaller models).", "dim"))
-    print(_c("  You can change the model itself later via /settings.", "dim"))
-    answers["embedder_dim"] = ask_int(
-        "Embedding dimension",
-        default=defaults.get("embedder_dim", 1536),
+
+def _ask_credentials(prefix_label: str, defaults: dict, key_env: str, base_default: str) -> tuple[str, str, str]:
+    """Common credential subform for embedder + LLM steps.
+
+    Returns (api_key_env, api_key_plain, api_base). Exactly one of
+    ``api_key_env`` and ``api_key_plain`` will be non-empty (the env var
+    by default; falls through to plaintext only if the env var is unset
+    and the operator pastes the key directly).
+    """
+    print(_c(f"  {prefix_label} authentication", "dim"))
+    api_key_env = ask(
+        "Env var containing the API key",
+        default=defaults.get(key_env, "OPENAI_API_KEY"),
+        allow_empty=True,
     )
+    api_key_plain = ""
+    if api_key_env and not os.environ.get(api_key_env):
+        print(_c(f"  ! env var {api_key_env!r} is currently unset.", "yellow"))
+        if ask_bool("Paste the key now (saved as plaintext in yaml)?", default=False):
+            api_key_plain = ask("API key", allow_empty=False)
+            api_key_env = ""  # plaintext takes precedence — clear the env reference
+    api_base = ask(
+        "Custom api_base (Ollama / OpenRouter / OneAPI / Azure URL)",
+        default=defaults.get("llm_api_base" if "llm" in prefix_label.lower() else "embedder_api_base", base_default),
+        allow_empty=True,
+    )
+    return api_key_env, api_key_plain, api_base
+
+
+def _step_embedder(answers: dict, defaults: dict) -> None:
+    while True:
+        print(_c("  The embedding model converts text into vectors. Its output", "dim"))
+        print(_c("  dimension MUST match your vector store's `dimension`.", "dim"))
+        print(_c("  Common: 1536 (OpenAI small), 3072 (OpenAI large), 1024 (BGE-M3).", "dim"))
+        answers["embedder_model"] = ask(
+            "Embedding model (litellm format)",
+            default=answers.get("embedder_model")
+                or defaults.get("embedder_model", "openai/text-embedding-3-small"),
+        )
+        answers["embedder_dim"] = ask_int(
+            "Embedding dimension",
+            default=answers.get("embedder_dim") or defaults.get("embedder_dim", 1536),
+        )
+        api_key_env, api_key_plain, api_base = _ask_credentials(
+            "Embedder", defaults, "embedder_api_key_env", ""
+        )
+        answers["embedder_api_key_env"] = api_key_env
+        answers["embedder_api_key"] = api_key_plain
+        answers["embedder_api_base"] = api_base
+
+        # Live test
+        print()
+        print(_c("  testing embedding endpoint…", "dim"))
+        key = _resolve_key(api_key_plain, api_key_env)
+        ok, msg = _test_embedding(answers["embedder_model"], key, api_base or None)
+        if ok:
+            print(_c(f"  ✓ {msg}", "green"))
+            return
+        choice = _confirm_test_failure("Embedding", msg)
+        if choice == "retry":
+            continue
+        if choice == "back":
+            raise _GoBack()
+        if choice == "abort":
+            raise Aborted()
+        # "skip" — accept and move on
+        return
+
+
+def _step_llm(answers: dict, defaults: dict) -> None:
+    while True:
+        print(_c("  The answer-generation LLM produces the final answer text.", "dim"))
+        print(_c("  Any litellm-compatible model works (OpenAI / Anthropic / DeepSeek /", "dim"))
+        print(_c("  Ollama / OpenRouter / Azure / Bedrock / Vertex / ...).", "dim"))
+        answers["llm_model"] = ask(
+            "Generator model (litellm format)",
+            default=answers.get("llm_model")
+                or defaults.get("llm_model", "openai/gpt-4o-mini"),
+        )
+        api_key_env, api_key_plain, api_base = _ask_credentials(
+            "LLM", defaults, "llm_api_key_env", ""
+        )
+        answers["llm_api_key_env"] = api_key_env
+        answers["llm_api_key"] = api_key_plain
+        answers["llm_api_base"] = api_base
+
+        # Live test
+        print()
+        print(_c("  testing generator endpoint (one short completion call)…", "dim"))
+        key = _resolve_key(api_key_plain, api_key_env)
+        ok, msg = _test_completion(answers["llm_model"], key, api_base or None)
+        if ok:
+            print(_c(f"  ✓ {msg}", "green"))
+            return
+        choice = _confirm_test_failure("LLM", msg)
+        if choice == "retry":
+            continue
+        if choice == "back":
+            raise _GoBack()
+        if choice == "abort":
+            raise Aborted()
+        # "skip" — accept and move on
+        return
+
+
+# ---------------------------------------------------------------------------
+# The wizard
+# ---------------------------------------------------------------------------
+
+
+_STEPS: list[tuple[str, Callable[[dict, dict], None]]] = [
+    ("Metadata database (PostgreSQL)", _step_postgres),
+    ("Vector database",                _step_vector),
+    ("Blob storage",                   _step_blob),
+    ("Embedding model",                _step_embedder),
+    ("Answer-generation LLM",          _step_llm),
+]
+
+
+def _non_interactive_defaults(profile: str) -> dict[str, Any]:
+    d = _profile_defaults(profile)
+    if not d:
+        return d
+    # Fill in fields the per-step functions would normally set so
+    # build_config_dict has everything it needs without prompting.
+    d.setdefault("relational", "postgres")
+    d.setdefault("pg_host", "localhost")
+    d.setdefault("pg_port", 5432)
+    d.setdefault("pg_database", "forgerag")
+    d.setdefault("pg_user", "forgerag")
+    d.setdefault("pg_password_env", "PG_PASSWORD")
+    d.setdefault("blob_root", "./storage/blobs")
+    if d.get("vector") == "chromadb":
+        d.setdefault("chroma_dir", "./storage/chroma")
+    d.setdefault("embedder_api_key", "")
+    d.setdefault("llm_api_key", "")
+    return d
+
+
+def run_wizard(profile: str, non_interactive: bool) -> dict[str, Any]:
+    """Return a dict of answers that the yaml builder consumes."""
+    defaults = _profile_defaults(profile)
+
+    if non_interactive:
+        d = _non_interactive_defaults(profile)
+        if not d:
+            print("error: --non-interactive requires --profile dev|prod", file=sys.stderr)
+            raise Aborted()
+        return d
+
+    banner("ForgeRAG setup wizard")
+    print(_c("  Press Enter to accept the default in [yellow].", "dim"))
+    print(_c("  Type 'b' / 'back' / '<' to re-open the previous step.", "dim"))
+    print(_c("  Ctrl-C to abort.", "dim"))
+
+    answers: dict[str, Any] = {}
+    i = 0
+    while i < len(_STEPS):
+        title, fn = _STEPS[i]
+        section(f"{i + 1}/{len(_STEPS)}  {title}")
+        try:
+            fn(answers, defaults)
+        except _GoBack:
+            if i == 0:
+                print(_c("  already at the first step — nowhere to go back.", "yellow"))
+                continue
+            i -= 1
+            continue
+        i += 1
 
     section("Done!")
-    print()
-    print(_c("  LLM models, API keys, parsing strategy, and retrieval", "dim"))
-    print(_c("  options are configured via the web UI after startup.", "dim"))
-    print(_c("  Visit /settings or use PUT /settings/key/{key}.", "dim"))
-
     return answers
 
 
@@ -481,8 +747,29 @@ def build_config_dict(a: dict[str, Any]) -> dict[str, Any]:
 
     cfg["persistence"] = {"relational": rel, "vector": vec}
 
-    # --- embedder (dimension only; model/key/base via /settings) ---
-    cfg["embedder"] = {"dimension": a["embedder_dim"]}
+    # --- embedder ---
+    embedder_litellm: dict[str, Any] = {"model": a["embedder_model"]}
+    if a.get("embedder_api_key"):
+        embedder_litellm["api_key"] = a["embedder_api_key"]
+    elif a.get("embedder_api_key_env"):
+        embedder_litellm["api_key_env"] = a["embedder_api_key_env"]
+    if a.get("embedder_api_base"):
+        embedder_litellm["api_base"] = a["embedder_api_base"]
+    cfg["embedder"] = {
+        "backend": "litellm",
+        "dimension": a["embedder_dim"],
+        "litellm": embedder_litellm,
+    }
+
+    # --- answering generator ---
+    generator: dict[str, Any] = {"backend": "litellm", "model": a["llm_model"]}
+    if a.get("llm_api_key"):
+        generator["api_key"] = a["llm_api_key"]
+    elif a.get("llm_api_key_env"):
+        generator["api_key_env"] = a["llm_api_key_env"]
+    if a.get("llm_api_base"):
+        generator["api_base"] = a["llm_api_base"]
+    cfg["answering"] = {"generator": generator}
 
     # --- files ---
     cfg["files"] = {"hash_algorithm": "sha256", "max_bytes": 524288000}
@@ -511,6 +798,15 @@ def write_yaml(cfg: dict[str, Any], path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _child_env() -> dict[str, str]:
+    """Subprocess env that inherits ours plus forces UTF-8 stdio so child
+    Python processes don't crash on box-drawing / arrow chars under
+    Windows GBK consoles."""
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
+
+
 def post_setup(config_path: Path) -> None:
     section("Next steps")
 
@@ -519,6 +815,7 @@ def post_setup(config_path: Path) -> None:
         r = subprocess.run(
             [sys.executable, "-m", "config", "validate", str(config_path)],
             cwd=_ROOT,
+            env=_child_env(),
         )
         if r.returncode != 0:
             print(_c("  config validation FAILED — fix the file and re-run", "magenta"))
@@ -531,8 +828,8 @@ def post_setup(config_path: Path) -> None:
         "What do you want to do next?",
         [
             ("nothing", "just exit; run it yourself later"),
-            ("batch", "batch-ingest files from a directory now"),
-            ("api", "start the HTTP API (uvicorn) now"),
+            ("batch",   "batch-ingest files from a directory now"),
+            ("api",     "start the HTTP API (uvicorn) now"),
         ],
         default="nothing",
     )
@@ -559,13 +856,13 @@ def post_setup(config_path: Path) -> None:
         if embed:
             cmd.append("--embed")
         print(_c(f"\n  running: {' '.join(cmd)}\n", "dim"))
-        subprocess.run(cmd, cwd=_ROOT)
+        subprocess.run(cmd, cwd=_ROOT, env=_child_env())
         return
 
     if choice == "api":
         host = ask("Host", default="0.0.0.0")
         port = ask_int("Port", default=8000)
-        env = os.environ.copy()
+        env = _child_env()
         env["FORGERAG_CONFIG"] = str(config_path)
         cmd = [
             sys.executable,
@@ -594,39 +891,36 @@ def post_setup(config_path: Path) -> None:
 _HELP_DESCRIPTION = """\
 Interactive setup wizard for ForgeRAG.
 
-Walks through six questions and generates a forgerag.yaml config
-file that wires together the relational store, vector store, blob
-storage, embedder, answer LLM, and optional MinerU parser. After
-writing the file, the wizard validates it and offers to batch-ingest
-a directory or start the HTTP API right away.
+Walks through five small steps and writes a forgerag.yaml that wires
+together the relational store, vector store, blob storage, embedder,
+and answer-generation LLM. The embedder and LLM steps each finish with
+a real connection test (live API call) so a typo in api_base or a
+wrong key surfaces immediately.
+
+Type 'b' / 'back' / '<' at any prompt to re-open the previous step.
 
 All LLM / embedding backends go through litellm, which accepts custom
 endpoints via an api_base setting -- so Ollama, vLLM, OneAPI,
-OpenRouter, DeepSeek, any OpenAI-compatible server all work with the
-same model string.
+OpenRouter, DeepSeek, Azure, any OpenAI-compatible server all work
+with the same model string.
 """
 
 _HELP_EPILOG = """\
 Profiles
 --------
-  dev    SQLite + ChromaDB + local blob.
-         Zero infrastructure, good for local experimentation.
+  dev    ChromaDB + local blob + OpenAI defaults.
+         Zero infrastructure beyond Postgres, good for local exper.
 
-  prod   Postgres + pgvector + local blob.
+  prod   pgvector + local blob + OpenAI defaults.
          Recommended for a single production node.
 
   custom Full wizard, no presets. Use when you know what you want.
 
-LLM / model / retrieval configuration
---------------------------------------
-  These are NOT set in the yaml or the wizard. They are managed
-  at runtime via the /settings API (DB-backed, frontend-editable):
-
-    GET  /settings              — view all settings grouped
-    PUT  /settings/key/{key}    — change one setting instantly
-
-  On first startup, defaults are seeded into the DB automatically.
-  Configure your API keys, models, and retrieval strategy there.
+LLM / model configuration
+-------------------------
+  Model + api_key + api_base ARE set here so the wizard can verify
+  the connection live. Other tunables (temperature, prompts,
+  retrieval strategy) remain runtime-editable via /settings.
 
 Typical runs
 ------------
@@ -667,7 +961,7 @@ def parse_args() -> argparse.Namespace:
         "--profile",
         choices=("dev", "prod", "custom"),
         default="custom",
-        help="Preset defaults. dev=sqlite+chroma; prod=postgres+pgvector.",
+        help="Preset defaults. dev=chromadb+local; prod=pgvector+local.",
     )
     p.add_argument(
         "-o",
