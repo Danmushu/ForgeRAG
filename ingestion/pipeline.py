@@ -428,7 +428,8 @@ class IngestionPipeline:
             return
 
         kg_cfg = self.kg_extraction_cfg
-        if not (kg_cfg and kg_cfg.enabled):
+        if kg_cfg is None:
+            # No KG extraction config wired in (e.g. test environment).
             self.rel.update_document_status(doc_id, kg_status="skipped")
             return
 
@@ -501,7 +502,11 @@ class IngestionPipeline:
                         rel_m,
                     )
 
-            if getattr(kg_cfg, "embed_entity_names", False) and self.embedder is not None:
+            # Always embed entity names + relation descriptions when an
+            # embedder is available — the dependent retrieval features
+            # (entity_disambiguation, KGPath relation-semantic search)
+            # silently degrade without these vectors.
+            if self.embedder is not None:
                 ents_to_embed = [e for e in entities if not e.name_embedding]
                 if ents_to_embed:
                     try:
@@ -511,7 +516,6 @@ class IngestionPipeline:
                     except Exception:
                         log.warning("Entity name embedding failed for %s", doc_id)
 
-            if getattr(kg_cfg, "embed_relations", False) and self.embedder is not None:
                 rels_to_embed = [r for r in relations if r.description and not r.description_embedding]
                 if rels_to_embed:
                     try:

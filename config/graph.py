@@ -33,9 +33,13 @@ class Neo4jConfig(BaseModel):
 
 
 class EntityDisambiguationConfig(BaseModel):
-    """Embedding-based entity deduplication at upsert time."""
+    """Embedding-based entity deduplication at upsert time.
 
-    enabled: bool = False
+    No ``enabled`` toggle: when a ``graph_store`` is configured, the
+    KG path always wraps it in ``DisambiguatingGraphStore``. Tune the
+    threshold lower to merge less aggressively if false-positives appear.
+    """
+
     similarity_threshold: float = 0.85
     candidate_top_k: int = 10
 

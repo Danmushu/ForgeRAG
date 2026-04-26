@@ -139,9 +139,9 @@ class AnsweringPipeline:
         _reuse = False
         _early_qu_done = False
         qp_early = None
-        qu_enabled = getattr(self.retrieval.cfg, "query_understanding", None)
-        qu_enabled = qu_enabled and qu_enabled.enabled
-        # Per-request override wins over yaml
+        # QueryUnderstanding has no cfg-level toggle anymore; it runs on
+        # every retrieve unless the per-request override turns it off.
+        qu_enabled = True
         if overrides is not None and getattr(overrides, "query_understanding", None) is not None:
             qu_enabled = bool(overrides.query_understanding)
         if qu_enabled:

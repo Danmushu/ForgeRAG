@@ -97,26 +97,26 @@ class AppState:
             self.graph_store = make_graph_store(cfg.graph)
             log.info("graph store initialized: %s", cfg.graph.backend)
 
-            # Wrap with entity disambiguation if enabled
-            if cfg.graph.entity_disambiguation.enabled:
-                try:
-                    from graph.disambiguator import DisambiguatingGraphStore, EntityDisambiguator
+            # Always wrap with entity disambiguation (no cfg toggle anymore —
+            # tune via entity_disambiguation.similarity_threshold instead).
+            try:
+                from graph.disambiguator import DisambiguatingGraphStore, EntityDisambiguator
 
-                    disambiguator = EntityDisambiguator(
-                        embedder=self.embedder,
-                        threshold=cfg.graph.entity_disambiguation.similarity_threshold,
-                        candidate_top_k=cfg.graph.entity_disambiguation.candidate_top_k,
-                    )
-                    existing = self.graph_store.get_all_entities()
-                    disambiguator.load_existing(existing)
-                    self.graph_store = DisambiguatingGraphStore(self.graph_store, disambiguator)
-                    log.info(
-                        "entity disambiguation enabled (threshold=%.2f, cached=%d)",
-                        cfg.graph.entity_disambiguation.similarity_threshold,
-                        len(existing),
-                    )
-                except Exception as e:
-                    log.warning("entity disambiguation init failed: %s", e)
+                disambiguator = EntityDisambiguator(
+                    embedder=self.embedder,
+                    threshold=cfg.graph.entity_disambiguation.similarity_threshold,
+                    candidate_top_k=cfg.graph.entity_disambiguation.candidate_top_k,
+                )
+                existing = self.graph_store.get_all_entities()
+                disambiguator.load_existing(existing)
+                self.graph_store = DisambiguatingGraphStore(self.graph_store, disambiguator)
+                log.info(
+                    "entity disambiguation enabled (threshold=%.2f, cached=%d)",
+                    cfg.graph.entity_disambiguation.similarity_threshold,
+                    len(existing),
+                )
+            except Exception as e:
+                log.warning("entity disambiguation init failed: %s", e)
         except Exception as e:
             log.warning("graph store not available: %s", e, exc_info=True)
 

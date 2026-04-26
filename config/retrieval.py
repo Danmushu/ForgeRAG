@@ -94,8 +94,12 @@ class MergeConfig(BaseModel):
 
 
 class RerankConfig(BaseModel):
-    enabled: bool = False
-    backend: Literal["passthrough", "rerank_api", "llm_as_reranker"] = "passthrough"
+    # No ``enabled`` toggle: rerank is part of the pipeline. Per-query opt-out
+    # via ``QueryOverrides.rerank=False`` (e.g. for benchmark A/B). Default
+    # backend is ``llm_as_reranker`` (reuses generator credentials);
+    # production deployments with a dedicated rerank API can switch to
+    # ``rerank_api``; ``passthrough`` is the no-op baseline.
+    backend: Literal["passthrough", "rerank_api", "llm_as_reranker"] = "llm_as_reranker"
     # on_failure="strict" raises the error so the UI lights up red on the
     # architecture graph; "passthrough" silently returns top_k by RRF order
     # (the legacy behaviour that hid bugs). Default is strict so users
@@ -120,9 +124,12 @@ class CitationsConfig(BaseModel):
 
 
 class QueryUnderstandingConfig(BaseModel):
-    """Unified query understanding: intent + routing + expansion."""
+    """Unified query understanding: intent + routing + expansion.
 
-    enabled: bool = False
+    No ``enabled`` toggle: QU runs on every retrieve(). Per-query opt-out
+    via ``QueryOverrides.query_understanding=False``.
+    """
+
     model: str = "openai/gpt-4o-mini"
     api_key: str | None = None
     api_key_env: str | None = None
@@ -134,17 +141,23 @@ class QueryUnderstandingConfig(BaseModel):
 
 
 class KGExtractionConfig(BaseModel):
-    """Ingestion-time entity/relation extraction settings."""
+    """Ingestion-time entity/relation extraction settings.
 
-    enabled: bool = False
+    No ``enabled`` toggle: when ``graph_store`` is configured (i.e.
+    Neo4j credentials are set), every ingest runs KG extraction.
+    To opt out entirely, leave the graph store unconfigured.
+    Entity-name and relation-description embeddings are likewise
+    always computed because both downstream paths
+    (``EntityDisambiguation``, ``KGPath.relation_weight`` semantic
+    search) silently degrade without them.
+    """
+
     model: str = "openai/gpt-4o-mini"
     api_key: str | None = None
     api_key_env: str | None = None
     api_base: str | None = None
     max_workers: int = 5
     timeout: float = 120.0
-    embed_relations: bool = False
-    embed_entity_names: bool = False
     # Description merge: LLM-consolidate fragmented entity/relation descriptions.
     # When an entity accumulates many description fragments (from multiple chunks
     # or documents), an LLM call synthesizes them into one concise description.
@@ -153,9 +166,13 @@ class KGExtractionConfig(BaseModel):
 
 
 class KGPathConfig(BaseModel):
-    """Knowledge graph retrieval path settings."""
+    """Knowledge graph retrieval path settings.
 
-    enabled: bool = False
+    No ``enabled`` toggle: when ``graph_store`` is configured the
+    KG path participates in retrieval. Per-query opt-out via
+    ``QueryOverrides.kg_path=False``.
+    """
+
     model: str = "openai/gpt-4o-mini"  # LLM for extracting entities from query
     api_key: str | None = None
     api_key_env: str | None = None

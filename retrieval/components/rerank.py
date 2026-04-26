@@ -38,7 +38,11 @@ class RerankComponent:
         enabled: bool | None = None,
     ) -> tuple[list[ScoredChunk], str | None]:
         top_k = top_k if top_k is not None else self.cfg.top_k
-        enabled = enabled if enabled is not None else self.cfg.enabled
+        # No cfg-level toggle anymore; the orchestrator passes
+        # ``enabled=False`` when QueryOverrides.rerank=False or when
+        # cfg.backend == "passthrough".
+        if enabled is None:
+            enabled = self.cfg.backend != "passthrough"
 
         with _tracer.start_as_current_span("forgerag.rerank") as span:
             span.set_attribute("forgerag.enabled", enabled)

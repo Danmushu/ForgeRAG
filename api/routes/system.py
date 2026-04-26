@@ -111,18 +111,23 @@ def rebuild_bm25(state: AppState = Depends(get_state)):
 @router.get("/retrieval-status", response_model=RetrievalStatus)
 def retrieval_status(state: AppState = Depends(get_state)):
     cfg = state.cfg.retrieval
+    # query_understanding / rerank / kg_path / kg_extraction no longer
+    # carry a cfg.enabled toggle. They run whenever their dependencies
+    # are configured: KG paths require state.graph_store; QU + rerank
+    # require LLM credentials (and we treat "model is set" as "configured").
+    has_graph = state.graph_store is not None
     return RetrievalStatus(
         vector_enabled=cfg.vector.enabled,
         bm25_enabled=cfg.bm25.enabled,
         tree_enabled=cfg.tree_path.enabled,
         tree_llm_nav_enabled=cfg.tree_path.llm_nav_enabled,
-        query_understanding_enabled=cfg.query_understanding.enabled,
-        rerank_enabled=cfg.rerank.enabled,
+        query_understanding_enabled=True,
+        rerank_enabled=True,
         descendant_expansion_enabled=cfg.merge.descendant_expansion_enabled,
         sibling_expansion_enabled=cfg.merge.sibling_expansion_enabled,
         crossref_expansion_enabled=cfg.merge.crossref_expansion_enabled,
-        kg_enabled=cfg.kg_path.enabled,
-        kg_extraction_enabled=cfg.kg_extraction.enabled,
+        kg_enabled=has_graph,
+        kg_extraction_enabled=has_graph,
     )
 
 

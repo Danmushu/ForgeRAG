@@ -90,9 +90,9 @@ class Reranker(Protocol):
 
 
 def make_reranker(cfg: RerankConfig) -> Reranker:
-    if not cfg.enabled or cfg.backend == "passthrough":
-        # Feature is off — publish "disabled" to health registry so the UI
-        # shows a gray dot rather than implying it's broken.
+    if cfg.backend == "passthrough":
+        # Backend explicitly set to no-op — publish "disabled" to health
+        # registry so the UI shows a gray dot rather than implying it's broken.
         if _get_health_registry is not None:
             try:
                 _get_health_registry().set_disabled("reranker")

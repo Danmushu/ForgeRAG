@@ -858,6 +858,44 @@ def _step_llm(answers: dict, defaults: dict) -> None:
         return
 
 
+def _step_image_enrichment(answers: dict, defaults: dict) -> None:
+    """Optional: enable VLM image enrichment (per-figure OCR + description).
+
+    Reuses the answer-LLM credentials so the user doesn't have to enter
+    them a second time. The LLM model itself must be vision-capable;
+    if not, the user can change ``image_enrichment.model`` later by
+    editing yaml. We default to the same model the user just picked.
+    """
+    print(_c(_t(
+        "  Image enrichment uses a vision LLM to OCR + describe figures",
+        "  图片增强会用视觉大模型对每张图做 OCR 与描述",
+    ), "dim"))
+    print(_c(_t(
+        "  during ingestion, so the figure becomes searchable as text.",
+        "  注入到 chunk 文本里，图片内容也能被检索到。",
+    ), "dim"))
+    print(_c(_t(
+        "  Costs an extra LLM call per figure block — skip if you're",
+        "  每张图多一次 LLM 调用 — 文档图很少时可以跳过。",
+    ), "dim"))
+    print(_c(_t(
+        "  ingesting text-heavy documents.",
+        "",
+    ), "dim"))
+    enable = ask_bool(
+        _t("Enable image enrichment?", "启用图片增强？"),
+        default=False,
+    )
+    answers["image_enrichment_enabled"] = enable
+    if not enable:
+        return
+    answers["image_enrichment_model"] = ask(
+        _t("Vision LLM model (must be vision-capable)",
+           "视觉大模型 (需要支持视觉输入)"),
+        default=answers.get("llm_model") or "openai/gpt-4o-mini",
+    )
+
+
 # ---------------------------------------------------------------------------
 # The wizard
 # ---------------------------------------------------------------------------
@@ -869,6 +907,7 @@ _STEPS: list[tuple[str, str, Callable[[dict, dict], None]]] = [
     ("Blob storage",                   "Blob 存储",                 _step_blob),
     ("Embedding model",                "向量嵌入模型",              _step_embedder),
     ("Answer-generation LLM",          "答案生成大模型",            _step_llm),
+    ("Image enrichment (optional)",    "图片增强 (可选)",            _step_image_enrichment),
 ]
 
 
@@ -1045,6 +1084,41 @@ def build_config_dict(a: dict[str, Any]) -> dict[str, Any]:
     if a.get("llm_api_base"):
         generator["api_base"] = a["llm_api_base"]
     cfg["answering"] = {"generator": generator}
+
+    # --- retrieval: thread the same LLM creds into the always-on
+    #     subsystems (query_understanding, rerank, kg_extraction, kg_path)
+    #     so they don't fail-loud on the first query for a missing key. ---
+    def _llm_creds_block() -> dict[str, Any]:
+        block: dict[str, Any] = {"model": a["llm_model"]}
+        if a.get("llm_api_key"):
+            block["api_key"] = a["llm_api_key"]
+        elif a.get("llm_api_key_env"):
+            block["api_key_env"] = a["llm_api_key_env"]
+        if a.get("llm_api_base"):
+            block["api_base"] = a["llm_api_base"]
+        return block
+
+    cfg["retrieval"] = {
+        "query_understanding": _llm_creds_block(),
+        "rerank":              _llm_creds_block(),
+        "kg_extraction":       _llm_creds_block(),
+        "kg_path":             _llm_creds_block(),
+    }
+
+    # --- image enrichment (optional — wizard step asks) ---
+    if a.get("image_enrichment_enabled"):
+        ie: dict[str, Any] = {
+            "enabled": True,
+            "model": a.get("image_enrichment_model") or a["llm_model"],
+        }
+        # Reuse the answer-LLM credentials.
+        if a.get("llm_api_key"):
+            ie["api_key"] = a["llm_api_key"]
+        elif a.get("llm_api_key_env"):
+            ie["api_key_env"] = a["llm_api_key_env"]
+        if a.get("llm_api_base"):
+            ie["api_base"] = a["llm_api_base"]
+        cfg["image_enrichment"] = ie
 
     # --- files ---
     cfg["files"] = {"hash_algorithm": "sha256", "max_bytes": 524288000}

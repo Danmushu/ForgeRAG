@@ -24,24 +24,22 @@ from retrieval.rerank import (
 # ---------------------------------------------------------------------------
 
 
-def test_factory_disabled_returns_passthrough():
-    assert isinstance(make_reranker(RerankConfig(enabled=False)), PassthroughReranker)
-
-
-def test_factory_explicit_passthrough():
+def test_factory_passthrough_backend():
+    """``backend=passthrough`` is the no-op baseline (rerank toggle was
+    removed in favour of selecting the backend explicitly)."""
     assert isinstance(
-        make_reranker(RerankConfig(enabled=True, backend="passthrough")),
+        make_reranker(RerankConfig(backend="passthrough")),
         PassthroughReranker,
     )
 
 
 def test_factory_rerank_api():
-    r = make_reranker(RerankConfig(enabled=True, backend="rerank_api"))
+    r = make_reranker(RerankConfig(backend="rerank_api"))
     assert isinstance(r, RerankApiReranker)
 
 
 def test_factory_llm_as_reranker():
-    r = make_reranker(RerankConfig(enabled=True, backend="llm_as_reranker"))
+    r = make_reranker(RerankConfig(backend="llm_as_reranker"))
     assert isinstance(r, LlmAsReranker)
 
 
@@ -49,7 +47,7 @@ def test_factory_rejects_legacy_litellm_value():
     """The old 'litellm' backend name was renamed to 'llm_as_reranker'.
     Pydantic must reject the old string value so users can't keep using it."""
     with pytest.raises(Exception):  # pydantic ValidationError
-        RerankConfig(enabled=True, backend="litellm")
+        RerankConfig(backend="litellm")
 
 
 # ---------------------------------------------------------------------------

@@ -275,8 +275,8 @@ class Setting(Base):
     Key-value store for runtime config overrides.
 
     The yaml file is the base config. Settings in this table are
-    OVERLAID on top — a key like "retrieval.rerank.enabled" with
-    value_json=true means "override that one field at runtime".
+    OVERLAID on top — a key like "retrieval.rerank.backend" with
+    value_json="passthrough" means "override that one field at runtime".
 
     Groups allow the frontend to organize settings into tabs:
         llm, embedding, retrieval, parsing, system

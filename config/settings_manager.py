@@ -84,14 +84,8 @@ EDITABLE_SETTINGS: list[tuple[str, str, str, str, str, list | None]] = [
     ("embedder.dimension", "embedding", "Dimension", "Must match the model's output dimension", "int", None),
     ("embedder.batch_size", "embedding", "Batch size", "Chunks per embedding API call", "int", None),
     # --- Retrieval: Query Understanding ---
-    (
-        "retrieval.query_understanding.enabled",
-        "query_understanding",
-        "Enable query understanding",
-        "Intent classification, retrieval routing, and query expansion in a single LLM call",
-        "bool",
-        None,
-    ),
+    # No ``enabled`` knob — QU runs on every retrieve(); per-query opt-out
+    # is via the ``QueryOverrides.query_understanding`` API parameter.
     (
         "retrieval.query_understanding.model",
         "query_understanding",
@@ -300,19 +294,10 @@ EDITABLE_SETTINGS: list[tuple[str, str, str, str, str, list | None]] = [
         None,
     ),
     # --- Rerank ---
-    (
-        "retrieval.rerank.enabled",
-        "rerank",
-        "Enable rerank",
-        (
-            "Recommended. Cross-encoder re-scoring of RRF candidates. In our "
-            "benchmark this raised Context Precision by 78% (0.15 → 0.267). "
-            "Requires a reranker provider — use the 'SiliconFlow · BGE Reranker' "
-            "preset for a quick start."
-        ),
-        "bool",
-        None,
-    ),
+    # No ``enabled`` knob — rerank always runs (default backend
+    # ``llm_as_reranker`` reuses generator credentials). Per-query opt-out:
+    # ``QueryOverrides.rerank=False``. Use ``backend=passthrough`` for the
+    # no-op A/B baseline.
     (
         "retrieval.rerank.backend",
         "rerank",
@@ -744,14 +729,11 @@ EDITABLE_SETTINGS: list[tuple[str, str, str, str, str, list | None]] = [
         None,
     ),
     # --- Knowledge Graph: Extraction (ingestion-time) ---
-    (
-        "retrieval.kg_extraction.enabled",
-        "kg_extraction",
-        "Enable KG extraction",
-        "Extract entities and relations from chunks during ingestion",
-        "bool",
-        None,
-    ),
+    # No ``enabled`` knob — KG extraction runs on every ingest when a
+    # graph store is configured. Opt out by leaving Neo4j credentials unset.
+    # Entity-name and relation-description embeddings are also unconditional
+    # because the disambiguation + relation-semantic-search features
+    # silently degrade without them.
     (
         "retrieval.kg_extraction.model",
         "kg_extraction",
@@ -768,31 +750,9 @@ EDITABLE_SETTINGS: list[tuple[str, str, str, str, str, list | None]] = [
         "int",
         None,
     ),
-    (
-        "retrieval.kg_extraction.embed_relations",
-        "kg_extraction",
-        "Embed relations",
-        "Embed relation descriptions for semantic search at query time",
-        "bool",
-        None,
-    ),
-    (
-        "retrieval.kg_extraction.embed_entity_names",
-        "kg_extraction",
-        "Embed entity names",
-        "Embed entity names for disambiguation (requires entity_disambiguation enabled)",
-        "bool",
-        None,
-    ),
     # --- Knowledge Graph: Retrieval path ---
-    (
-        "retrieval.kg_path.enabled",
-        "kg",
-        "Enable KG retrieval",
-        "Multi-hop entity-relation traversal at query time",
-        "bool",
-        None,
-    ),
+    # No ``enabled`` knob — KG path participates whenever the graph store
+    # is configured. Per-query opt-out: ``QueryOverrides.kg_path=False``.
     (
         "retrieval.kg_path.model",
         "kg",
@@ -823,7 +783,7 @@ EDITABLE_SETTINGS: list[tuple[str, str, str, str, str, list | None]] = [
         "retrieval.kg_path.relation_weight",
         "kg",
         "Relation semantic weight",
-        "Weight for relation description semantic search (0-1). Requires embed_relations.",
+        "Weight for relation description semantic search (0-1)",
         "float",
         None,
     ),

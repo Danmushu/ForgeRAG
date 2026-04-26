@@ -194,7 +194,7 @@ def _print_summary(path: Path, cfg: AppConfig) -> None:
     lines.append(f"  sibling_expansion     : {r.merge.sibling_expansion_enabled}")
     lines.append(f"  crossref_expansion    : {r.merge.crossref_expansion_enabled}")
     lines.append(
-        f"  rerank                : enabled={r.rerank.enabled} backend={r.rerank.backend} top_k={r.rerank.top_k}"
+        f"  rerank                : backend={r.rerank.backend} top_k={r.rerank.top_k}"
     )
     lines.append("")
 

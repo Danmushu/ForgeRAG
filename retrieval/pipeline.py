@@ -276,14 +276,12 @@ class RetrievalPipeline:
     ):
         """Run query understanding only (no retrieval).
 
-        Returns a ``QueryPlan`` on success, ``None`` if QU is globally
-        disabled in cfg. By default (``strict=True``) any exception from
-        the underlying LLM call bubbles up wrapped in ``RetrievalError``;
-        pass ``strict=False`` for the legacy "log + return None" behaviour.
+        Returns a ``QueryPlan`` on success. By default (``strict=True``)
+        any exception from the underlying LLM call bubbles up wrapped in
+        ``RetrievalError``; pass ``strict=False`` for the legacy
+        "log + return None" behaviour.
         """
         qu_cfg = self.cfg.query_understanding
-        if not qu_cfg.enabled:
-            return None
         try:
             from .query_understanding import QueryUnderstanding
 
@@ -372,11 +370,15 @@ class RetrievalPipeline:
             v = getattr(overrides, attr, None)
             return default if v is None else v
 
-        eff_qu_on        = _ov("query_understanding", self.cfg.query_understanding.enabled)
-        eff_kg_on        = _ov("kg_path",       self.cfg.kg_path.enabled)
+        # query_understanding / kg_path / rerank no longer have a cfg-level
+        # ``enabled`` toggle: when their dependencies are configured (LLM
+        # creds, graph_store) they always run. Per-query opt-out is via
+        # ``QueryOverrides.{query_understanding,kg_path,rerank} = False``.
+        eff_qu_on        = _ov("query_understanding", True)
+        eff_kg_on        = _ov("kg_path",       True)
         eff_tree_on      = _ov("tree_path",     self.cfg.tree_path.enabled)
         eff_tree_llm_nav = _ov("tree_llm_nav",  self.cfg.tree_path.llm_nav_enabled)
-        eff_rerank_on    = _ov("rerank",        self.cfg.rerank.enabled)
+        eff_rerank_on    = _ov("rerank",        True)
 
         eff_bm25_top_k   = _ov("bm25_top_k",    self.cfg.bm25.top_k)
         eff_vector_top_k = _ov("vector_top_k",  self.cfg.vector.top_k)
