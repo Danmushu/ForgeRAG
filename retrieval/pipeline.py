@@ -52,6 +52,15 @@ from .types import RetrievalResult, ScoredChunk
 _tracer = get_tracer()
 
 
+def _doc_id_from_chunk_id(chunk_id: str) -> str:
+    """Extract doc_id from a ``{doc_id}:{parse_version}:c{seq}`` chunk_id.
+
+    Falls back to the full id if the format is unexpected.
+    """
+    parts = chunk_id.rsplit(":", 2)
+    return parts[0] if len(parts) == 3 else chunk_id
+
+
 def _propagate_ctx(fn):
     """
     Decorator: capture the current OTel context when the wrapped function
@@ -384,12 +393,29 @@ class RetrievalPipeline:
         # via overrides.allow_partial_failure to swallow and continue.
         eff_allow_partial = _ov("allow_partial_failure", False)
 
-        # Warn if override asks for LLM tree navigation but yaml had it
-        # off — the navigator is lazy-built at startup, can't enable now.
+        # Override asks for LLM tree navigation but the navigator wasn't
+        # built at startup. Fail loud only if the client EXPLICITLY set
+        # this via overrides — silently downgrading would violate the
+        # explicit request. yaml defaults (no override) keep the original
+        # warn-and-fallback behaviour so existing deployments don't break
+        # when LLMTreeNavigator wiring is absent.
         if eff_tree_llm_nav and self.navigator is None:
+            override_set = (
+                overrides is not None
+                and getattr(overrides, "tree_llm_nav", None) is True
+            )
+            if override_set and not eff_allow_partial:
+                raise RetrievalError(
+                    "tree_llm_nav",
+                    RuntimeError(
+                        "overrides.tree_llm_nav=true but LLMTreeNavigator is not "
+                        "initialised (yaml retrieval.tree_path.llm_nav_enabled=false). "
+                        "Set overrides.allow_partial_failure=true to fall back to heuristic."
+                    ),
+                )
             log.warning(
-                "overrides.tree_llm_nav=true but LLMTreeNavigator is not initialised "
-                "(yaml retrieval.tree_path.llm_nav_enabled=false); falling back to heuristic"
+                "tree_llm_nav requested but LLMTreeNavigator is not initialised; "
+                "falling back to heuristic"
             )
             eff_tree_llm_nav = False
 
@@ -647,11 +673,15 @@ class RetrievalPipeline:
             from .tree_path import PreFilterHit
 
             prefilter_hits: list[PreFilterHit] = []
-            # Resolve chunk metadata for heat map (node_id, doc_id, snippet)
-            _prefilter_chunk_ids = [s.chunk_id for s in bm25_hits + vector_hits]
+            # Resolve chunk metadata for heat map (node_id, doc_id, snippet).
+            # Take top-50 from each path so a deep BM25 list doesn't crowd
+            # out the vector signal — the tree navigator wants both as hints.
+            _bm25_pf = [s.chunk_id for s in bm25_hits[:50]]
+            _vec_pf = [s.chunk_id for s in vector_hits[:50]]
+            _prefilter_chunk_ids = list(dict.fromkeys(_bm25_pf + _vec_pf))  # dedup, preserve order
             _prefilter_rows = {}
             if _prefilter_chunk_ids:
-                for row in self.rel.get_chunks_by_ids(_prefilter_chunk_ids[:100]):
+                for row in self.rel.get_chunks_by_ids(_prefilter_chunk_ids):
                     _prefilter_rows[row["chunk_id"]] = row
             for sc in bm25_hits:
                 row = _prefilter_rows.get(sc.chunk_id)
@@ -745,12 +775,30 @@ class RetrievalPipeline:
             (eff_tree_on and tree_hits) or (eff_kg_on and kg_hits)
         )
         if primary_has_hits:
+            covered_doc_ids: set[str] = set()
             if eff_tree_on and tree_hits:
                 rrf_inputs.append(tree_hits); active_paths.append("tree")
+                covered_doc_ids |= {_doc_id_from_chunk_id(s.chunk_id) for s in tree_hits}
             if eff_kg_on and kg_hits:
                 rrf_inputs.append(kg_hits); active_paths.append("kg")
+                covered_doc_ids |= {_doc_id_from_chunk_id(s.chunk_id) for s in kg_hits}
+            # Per-doc supplement: docs that BM25 / vector found but tree/KG
+            # didn't visit (e.g. tree_navigable=False, low quality, or just
+            # not selected). Without this they'd silently drop out of the
+            # answer even though pre-filter saw them.
+            if eff_tree_on and tree_hits:
+                if self.cfg.vector.enabled and vector_hits:
+                    vec_extra = [s for s in vector_hits if _doc_id_from_chunk_id(s.chunk_id) not in covered_doc_ids]
+                    if vec_extra:
+                        rrf_inputs.append(vec_extra); active_paths.append("vector_supplement")
+                if self.cfg.bm25.enabled and bm25_hits:
+                    bm25_extra = [s for s in bm25_hits if _doc_id_from_chunk_id(s.chunk_id) not in covered_doc_ids]
+                    if bm25_extra:
+                        rrf_inputs.append(bm25_extra); active_paths.append("bm25_supplement")
         else:
-            # No primary path — fuse BM25 + vector directly
+            # No primary path — fuse BM25 + vector directly. (BM25 / vector
+            # are always-on infrastructure paths; no per-request override
+            # exposed for them today, so reading cfg directly is correct.)
             if self.cfg.vector.enabled and vector_hits:
                 rrf_inputs.append(vector_hits); active_paths.append("vector_fallback")
             if self.cfg.bm25.enabled and bm25_hits:

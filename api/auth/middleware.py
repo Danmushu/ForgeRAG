@@ -156,7 +156,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 async def _authenticate(request: Request, cfg, store) -> AuthenticatedPrincipal | None:
     from persistence.models import AuthSession, AuthToken, AuthUser
-    from sqlalchemy import select
+    from sqlalchemy import and_, select, update
 
     # (1) Bearer token
     auth_header = request.headers.get("authorization") or ""
@@ -180,7 +180,23 @@ async def _authenticate(request: Request, cfg, store) -> AuthenticatedPrincipal 
                 raise AuthError("token expired")
             if not user.is_active:
                 raise AuthError("user disabled")
-            tok.last_used_at = datetime.utcnow()
+            # Atomic touch: only update last_used_at if the token is still
+            # valid right now. A concurrent revoke that lands between our
+            # SELECT and the UPDATE will have set revoked_at != NULL, so
+            # this UPDATE will match 0 rows and we'll reject the request.
+            now = datetime.utcnow()
+            res = sess.execute(
+                update(AuthToken)
+                .where(
+                    and_(
+                        AuthToken.token_hash == tid_hash,
+                        AuthToken.revoked_at.is_(None),
+                    )
+                )
+                .values(last_used_at=now)
+            )
+            if (res.rowcount or 0) == 0:
+                raise AuthError("token revoked")
             sess.commit()
             return AuthenticatedPrincipal(
                 user_id=user.user_id,
