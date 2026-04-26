@@ -603,6 +603,48 @@ def _resolve_key(api_key: str | None, api_key_env: str | None) -> str | None:
     return None
 
 
+def _enable_litellm_debug() -> None:
+    """Turn on litellm's verbose debug — full request/response/headers go
+    to stderr so connection failures during the wizard show the actual
+    HTTP body / endpoint / payload instead of a one-line ``BadRequestError``."""
+    try:
+        import litellm  # type: ignore
+        # Idempotent: calling twice is a no-op.
+        if not getattr(litellm, "_forgerag_debug_on", False):
+            litellm._turn_on_debug()
+            litellm._forgerag_debug_on = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _format_exception(e: Exception) -> str:
+    """Render an exception with as much actionable detail as we can pull
+    out of common litellm / openai-style error shapes."""
+    parts = [f"{type(e).__name__}: {e}"]
+    # OpenAI-compatible HTTPException usually has .response with body.
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        body = None
+        try:
+            body = resp.json()
+        except Exception:
+            try:
+                body = resp.text
+            except Exception:
+                pass
+        if body:
+            parts.append(f"  response body: {body}")
+        status = getattr(resp, "status_code", None)
+        if status is not None:
+            parts.append(f"  http status:   {status}")
+    # litellm sometimes attaches .llm_provider and .model
+    for attr in ("llm_provider", "model"):
+        val = getattr(e, attr, None)
+        if val:
+            parts.append(f"  {attr:14} {val}")
+    return "\n".join(parts)
+
+
 def _test_embedding(
     model: str, key: str | None, base: str | None, *, timeout: float = 30.0
 ) -> tuple[bool, str, int | None]:
@@ -615,6 +657,7 @@ def _test_embedding(
         from litellm import embedding  # type: ignore
     except ImportError as e:
         return False, f"litellm not installed: {e}", None
+    _enable_litellm_debug()
     try:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -638,7 +681,7 @@ def _test_embedding(
         dim = len(vec)
         return True, f"ok (dim={dim})", dim
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}", None
+        return False, _format_exception(e), None
 
 
 def _test_completion(model: str, key: str | None, base: str | None, *, timeout: float = 30.0) -> tuple[bool, str]:
@@ -647,6 +690,7 @@ def _test_completion(model: str, key: str | None, base: str | None, *, timeout: 
         from litellm import completion  # type: ignore
     except ImportError as e:
         return False, f"litellm not installed: {e}"
+    _enable_litellm_debug()
     try:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -669,7 +713,7 @@ def _test_completion(model: str, key: str | None, base: str | None, *, timeout: 
         text = text.strip()[:60]
         return True, f"ok ({text!r})"
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, _format_exception(e)
 
 
 def _confirm_test_failure(target_en: str, target_zh: str, error: str) -> str:
@@ -685,7 +729,15 @@ def _confirm_test_failure(target_en: str, target_zh: str, error: str) -> str:
         f"  ✗ {target_en} connection test FAILED:",
         f"  ✗ {target_zh} 连接测试失败：",
     ), "magenta"))
-    print(_c(f"    {error}", "dim"))
+    # The error block was previously dim-coloured, which on some Windows
+    # consoles renders close to the background. Use yellow so it's always
+    # visible — the same colour we already use elsewhere for warnings.
+    for line in str(error).splitlines() or [str(error)]:
+        print(_c(f"    {line}", "yellow"))
+    print(_c(_t(
+        "    (See litellm debug output above for the full HTTP request/response.)",
+        "    (上方 litellm 调试日志包含完整请求/响应。)",
+    ), "dim"))
     return ask_choice(
         _t("What now?", "下一步？"),
         [
