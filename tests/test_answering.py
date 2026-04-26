@@ -193,7 +193,7 @@ class FakeRetrievalPipeline:
         self._citations = citations
         self.cfg = None
 
-    def retrieve(self, query, *, filter=None, chat_history=None, precomputed_plan=None):
+    def retrieve(self, query, *, filter=None, chat_history=None, precomputed_plan=None, overrides=None):
         return RetrievalResult(
             query=query,
             merged=self._merged,

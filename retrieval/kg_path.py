@@ -224,9 +224,9 @@ class KGPath:
                 # Use kg_path config; if api_key/api_base are empty, log and skip
                 if not self.cfg.api_key and not self.cfg.api_base:
                     log.warning(
-                        "KG path: no api_key or api_base configured "
-                        "(provider_id=%s) — skipping query entity extraction",
-                        getattr(self.cfg, "provider_id", None),
+                        "KG path: no api_key or api_base configured (model=%s) "
+                        "— skipping query entity extraction",
+                        self.cfg.model,
                     )
                     return [], []
                 from ingestion.kg_extractor import KGExtractor
