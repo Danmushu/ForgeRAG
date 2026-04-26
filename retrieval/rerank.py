@@ -43,9 +43,14 @@ except Exception:  # pragma: no cover — bare retrieval import path
     _get_health_registry = None  # type: ignore[assignment]
 
 
-def _record_health(component: str, ok: bool, latency_ms: int | None = None,
-                   error_type: str | None = None, error_msg: str | None = None,
-                   **extra: Any) -> None:
+def _record_health(
+    component: str,
+    ok: bool,
+    latency_ms: int | None = None,
+    error_type: str | None = None,
+    error_msg: str | None = None,
+    **extra: Any,
+) -> None:
     """Best-effort health recording. Never raises — if api module isn't
     importable (e.g. running retrieval from a script), silently skips."""
     if _get_health_registry is None:
@@ -205,6 +210,13 @@ class RerankApiReranker:
                 query="ping",
                 documents=["the quick brown fox", "hello world"],
                 top_n=2,
+                # We only need the index → score mapping; skip the
+                # echoed-back document text. Avoids LiteLLM's strict
+                # ``RerankResponse.results[*].document.text`` parser
+                # tripping on providers (notably SiliconFlow) that
+                # return ``document`` as an object rather than a plain
+                # string.
+                return_documents=False,
                 timeout=min(self.cfg.timeout, 15.0),
                 **kwargs,
             )
@@ -214,9 +226,13 @@ class RerankApiReranker:
             inner = f" (cause: {type(cause).__name__}: {cause})" if cause is not None else ""
             msg = f"probe failed: {type(e).__name__}: {e}{inner}"
             _record_health(
-                "reranker", ok=False, latency_ms=latency_ms,
-                error_type=type(e).__name__, error_msg=msg,
-                model=self.cfg.model, api_base=self.cfg.api_base,
+                "reranker",
+                ok=False,
+                latency_ms=latency_ms,
+                error_type=type(e).__name__,
+                error_msg=msg,
+                model=self.cfg.model,
+                api_base=self.cfg.api_base,
             )
             raise RerankerError(msg) from e
 
@@ -224,14 +240,21 @@ class RerankApiReranker:
         if not _extract_results(resp):
             msg = "probe returned empty results"
             _record_health(
-                "reranker", ok=False, latency_ms=latency_ms,
-                error_type="EmptyResults", error_msg=msg,
+                "reranker",
+                ok=False,
+                latency_ms=latency_ms,
+                error_type="EmptyResults",
+                error_msg=msg,
                 model=self.cfg.model,
             )
             raise RerankerError(msg)
         _record_health(
-            "reranker", ok=True, latency_ms=latency_ms,
-            model=self.cfg.model, api_base=self.cfg.api_base, probe=True,
+            "reranker",
+            ok=True,
+            latency_ms=latency_ms,
+            model=self.cfg.model,
+            api_base=self.cfg.api_base,
+            probe=True,
         )
 
     # ------------------------------------------------------------------
@@ -286,6 +309,10 @@ class RerankApiReranker:
                 query=query,
                 documents=docs,
                 top_n=min(top_k, len(docs)),
+                # See probe() for the rationale — we map by index, so
+                # the echoed-back ``document`` field is unused and only
+                # creates parser-fragility across providers.
+                return_documents=False,
                 timeout=self.cfg.timeout,
                 **kwargs,
             )
@@ -296,9 +323,13 @@ class RerankApiReranker:
             msg = f"{type(e).__name__}: {e}{inner}"
             log.warning("reranker API call failed: %s", msg)
             _record_health(
-                "reranker", ok=False, latency_ms=latency_ms,
-                error_type=type(e).__name__, error_msg=msg,
-                model=self.cfg.model, api_base=self.cfg.api_base,
+                "reranker",
+                ok=False,
+                latency_ms=latency_ms,
+                error_type=type(e).__name__,
+                error_msg=msg,
+                model=self.cfg.model,
+                api_base=self.cfg.api_base,
             )
             if self.cfg.on_failure == "strict":
                 raise RerankerError(msg) from e
@@ -315,8 +346,11 @@ class RerankApiReranker:
             msg = f"rerank API returned empty results (resp type={type(resp).__name__})"
             log.warning("%s; passthrough", msg)
             _record_health(
-                "reranker", ok=False, latency_ms=latency_ms,
-                error_type="EmptyResults", error_msg=msg,
+                "reranker",
+                ok=False,
+                latency_ms=latency_ms,
+                error_type="EmptyResults",
+                error_msg=msg,
                 model=self.cfg.model,
             )
             if self.cfg.on_failure == "strict":
@@ -324,9 +358,13 @@ class RerankApiReranker:
             return candidates[:top_k]
 
         _record_health(
-            "reranker", ok=True, latency_ms=latency_ms,
-            model=self.cfg.model, api_base=self.cfg.api_base,
-            docs=len(docs), results=len(results),
+            "reranker",
+            ok=True,
+            latency_ms=latency_ms,
+            model=self.cfg.model,
+            api_base=self.cfg.api_base,
+            docs=len(docs),
+            results=len(results),
         )
 
         picked: list[MergedChunk] = []
@@ -419,15 +457,23 @@ class LlmAsReranker:
             latency_ms = int((time.time() - t0) * 1000)
             msg = f"probe failed: {type(e).__name__}: {e}"
             _record_health(
-                "reranker", ok=False, latency_ms=latency_ms,
-                error_type=type(e).__name__, error_msg=msg,
-                model=self.cfg.model, mode="llm_as_reranker",
+                "reranker",
+                ok=False,
+                latency_ms=latency_ms,
+                error_type=type(e).__name__,
+                error_msg=msg,
+                model=self.cfg.model,
+                mode="llm_as_reranker",
             )
             raise RerankerError(msg) from e
         latency_ms = int((time.time() - t0) * 1000)
         _record_health(
-            "reranker", ok=True, latency_ms=latency_ms,
-            model=self.cfg.model, mode="llm_as_reranker", probe=True,
+            "reranker",
+            ok=True,
+            latency_ms=latency_ms,
+            model=self.cfg.model,
+            mode="llm_as_reranker",
+            probe=True,
         )
 
     # ------------------------------------------------------------------
@@ -478,9 +524,13 @@ class LlmAsReranker:
             latency_ms = int((time.time() - t0) * 1000)
             log.warning("reranker LLM call failed: %s", e)
             _record_health(
-                "reranker", ok=False, latency_ms=latency_ms,
-                error_type=type(e).__name__, error_msg=str(e),
-                model=self.cfg.model, mode="llm_as_reranker",
+                "reranker",
+                ok=False,
+                latency_ms=latency_ms,
+                error_type=type(e).__name__,
+                error_msg=str(e),
+                model=self.cfg.model,
+                mode="llm_as_reranker",
             )
             if self.cfg.on_failure == "strict":
                 raise RerankerError(str(e)) from e
@@ -491,17 +541,25 @@ class LlmAsReranker:
         if not order:
             msg = "LLM returned no parseable index array"
             _record_health(
-                "reranker", ok=False, latency_ms=latency_ms,
-                error_type="ParseError", error_msg=msg,
-                model=self.cfg.model, mode="llm_as_reranker",
+                "reranker",
+                ok=False,
+                latency_ms=latency_ms,
+                error_type="ParseError",
+                error_msg=msg,
+                model=self.cfg.model,
+                mode="llm_as_reranker",
             )
             if self.cfg.on_failure == "strict":
                 raise RerankerError(msg)
             return candidates[:top_k]
 
         _record_health(
-            "reranker", ok=True, latency_ms=latency_ms,
-            model=self.cfg.model, mode="llm_as_reranker", picked=len(order),
+            "reranker",
+            ok=True,
+            latency_ms=latency_ms,
+            model=self.cfg.model,
+            mode="llm_as_reranker",
+            picked=len(order),
         )
 
         # Keep only candidates the LLM ranked, in its order; pad with
