@@ -11,6 +11,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, model_validator
 
 from .answering import AnsweringSection, CORSConfig
+from .auth_config import AuthConfig
 from .benchmark import BenchmarkConfig
 from .cache import CacheConfig
 from .embedder import EmbedderConfig
@@ -18,6 +19,7 @@ from .files import FilesConfig
 from .graph import GraphConfig
 from .images import ImageEnrichmentConfig
 from .logging import LoggingConfig
+from .observability import ObservabilityConfig
 from .parser import ParserSection
 from .persistence import PersistenceConfig
 from .retrieval import RetrievalSection
@@ -38,6 +40,8 @@ class AppConfig(BaseModel):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     graph: GraphConfig = Field(default_factory=GraphConfig)
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
 
     @model_validator(mode="after")
     def _validate_dimensions(self) -> AppConfig:

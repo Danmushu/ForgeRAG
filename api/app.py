@@ -58,7 +58,7 @@ from .routes import files as file_routes
 from .routes import folders as folder_routes
 from .routes import graph as graph_routes
 from .routes import health as health_routes
-from .routes import llm_providers as llm_provider_routes
+from .routes import metrics as metrics_routes
 from .routes import query as query_routes
 from .routes import settings as settings_routes
 from .routes import system as system_routes
@@ -130,8 +130,27 @@ def create_app(
         from config.logging import setup_logging
 
         setup_logging(resolved.logging)
+
+        # Observability (OTel) — must happen BEFORE AppState is built so
+        # SQLAlchemy / httpx auto-instrumentation is in place when the
+        # relational store and any outbound HTTP clients come up.
+        from config.observability import bootstrap, instrument_app
+
+        bootstrap(resolved.observability)
+        instrument_app(app)
+
         built = AppState(resolved)
         app.state.app = built
+
+        # Auth: auto-provision the first admin when enabled + DB is empty.
+        # Safe no-op when auth.enabled=false or a user already exists.
+        try:
+            from .auth import bootstrap_if_empty
+
+            bootstrap_if_empty(resolved, built.store)
+        except Exception:
+            logging.getLogger(__name__).exception("auth bootstrap failed")
+
         # Component probes: surface configuration errors on startup instead
         # of waiting for the first user query. Health registry records the
         # result so the Architecture UI can light up red dots immediately.
@@ -229,11 +248,24 @@ def create_app(
     app.include_router(system_routes.router)
     app.include_router(trace_routes.router)
     app.include_router(settings_routes.router)
-    app.include_router(llm_provider_routes.router)
     app.include_router(graph_routes.router)
     app.include_router(benchmark_routes.router)
     app.include_router(folder_routes.router)
     app.include_router(trash_routes.router)
+    app.include_router(metrics_routes.router)
+    from .routes import auth as auth_routes
+    app.include_router(auth_routes.router)
+
+    # ── Auth middleware (no-op when auth.enabled=false) ──────────────
+    # Installed LAST so it wraps all routes above. The middleware reads
+    # AppState via app.state.app which is populated in the lifespan; it
+    # gracefully lets requests through until that appears.
+    from .auth import AuthMiddleware
+
+    def _state_getter(request):
+        return getattr(request.app.state, "app", None)
+
+    app.add_middleware(AuthMiddleware, state_getter=_state_getter)
 
     # ------------------------------------------------------------------
     # Serve frontend static files if web/ directory exists.
