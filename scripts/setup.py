@@ -678,10 +678,10 @@ def _step_relational(answers: dict, defaults: dict) -> None:
     answers["relational"] = ask_choice(
         _t("Which metadata database?", "选择元数据库后端？"),
         [
-            ("postgres", _t("PostgreSQL — multi-worker safe, recommended for production",
-                            "PostgreSQL — 多 worker 安全，生产推荐")),
-            ("sqlite",   _t("SQLite — single-process, zero extra services (dev / demo)",
-                            "SQLite — 单进程，无需额外服务（dev / demo）")),
+            ("postgres", _t("multi-worker safe, recommended for production",
+                            "多 worker 安全，生产推荐")),
+            ("sqlite",   _t("single-process, zero extra services (dev / demo)",
+                            "单进程，无需额外服务（dev / demo）")),
         ],
         default=defaults.get("relational", "postgres"),
     )
@@ -707,20 +707,20 @@ def _step_relational(answers: dict, defaults: dict) -> None:
 
 def _step_vector(answers: dict, defaults: dict) -> None:
     standalone = [
-        ("chromadb", _t("ChromaDB — lightweight, backend-agnostic",
-                        "ChromaDB — 轻量级，后端无关")),
-        ("qdrant",   _t("Qdrant — production-grade, rich filtering",
-                        "Qdrant — 生产级，丰富的过滤能力")),
-        ("milvus",   _t("Milvus — scalable, GPU-accelerated",
-                        "Milvus — 可扩展，支持 GPU 加速")),
-        ("weaviate", _t("Weaviate — multi-modal, GraphQL API",
-                        "Weaviate — 多模态，GraphQL API")),
+        ("chromadb", _t("lightweight, backend-agnostic",
+                        "轻量级，后端无关")),
+        ("qdrant",   _t("production-grade, rich filtering",
+                        "生产级，丰富的过滤能力")),
+        ("milvus",   _t("scalable, GPU-accelerated",
+                        "可扩展，支持 GPU 加速")),
+        ("weaviate", _t("multi-modal, GraphQL API",
+                        "多模态，GraphQL API")),
     ]
     # pgvector lives inside Postgres — only offer it when relational is postgres.
     if answers.get("relational") == "postgres":
         valid = [
-            ("pgvector", _t("pgvector — in-database, zero extra ops",
-                            "pgvector — 直接在 Postgres 内，无额外运维")),
+            ("pgvector", _t("in-database, zero extra ops",
+                            "直接在 Postgres 内，无额外运维")),
             *standalone,
         ]
     else:
@@ -861,8 +861,8 @@ def _step_graph(answers: dict, defaults: dict) -> None:
         [
             ("networkx", _t("single-process JSON, zero extra services",
                             "单进程 JSON，无需额外服务")),
-            ("neo4j",    _t("Neo4j 5.11+, multi-worker safe, recommended for production",
-                            "Neo4j 5.11+，多 worker 安全，生产推荐")),
+            ("neo4j",    _t("multi-worker safe, recommended for production (5.11+)",
+                            "多 worker 安全，生产推荐（5.11+）")),
         ],
         default=defaults.get("graph_backend", "networkx"),
     )
